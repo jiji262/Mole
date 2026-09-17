@@ -9,7 +9,37 @@ setup_file() {
     MOLE_TEST_MODE=1
     export MOLE_TEST_MODE
 
+    # The old-version cleaners default to the real /Applications bundles, and a
+    # case that stubs pgrep as "not running" would then delete a staged version
+    # on the Mac running the suite, including one a live browser is still using.
+    # Cases that need their own fixture bundle still override these per case.
+    MOLE_CHROME_APP_PATHS="$HOME/Applications/Google Chrome.app"
+    MOLE_EDGE_APP_PATHS="$HOME/Applications/Microsoft Edge.app"
+    MOLE_BRAVE_APP_PATHS="$HOME/Applications/Brave Browser.app"
+    export MOLE_CHROME_APP_PATHS MOLE_EDGE_APP_PATHS MOLE_BRAVE_APP_PATHS
+
     mkdir -p "$HOME"
+}
+
+@test "browser old-version cleaners stay inside the fixture HOME" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+_clean_chromium_old_versions() {
+    shift 3
+    printf 'APP:%s\n' "$@"
+}
+clean_chrome_old_versions
+clean_edge_old_versions
+clean_brave_old_versions
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"APP:$HOME/Applications/Google Chrome.app"* ]] || return 1
+    [[ "$output" == *"APP:$HOME/Applications/Microsoft Edge.app"* ]] || return 1
+    [[ "$output" == *"APP:$HOME/Applications/Brave Browser.app"* ]] || return 1
+    [[ "$output" != *"APP:/Applications/"* ]]
 }
 
 teardown_file() {
@@ -839,7 +869,11 @@ clean_chrome_old_versions() {
     _mole_record_clean_cancellation 124
     return 124
 }
+# Every cleaner after the cancelled one must stay unreached. Left unstubbed,
+# they would run against whatever MOLE_*_APP_PATHS points at.
 clean_edge_old_versions() { echo "UNEXPECTED_EDGE_CLEAN"; }
+clean_edge_updater_old_versions() { echo "UNEXPECTED_EDGE_UPDATER_CLEAN"; }
+clean_brave_old_versions() { echo "UNEXPECTED_BRAVE_CLEAN"; }
 set +e
 clean_browsers
 rc=$?
@@ -850,7 +884,9 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"BROWSER_RC:124 CANCEL:124"* ]] || return 1
-    [[ "$output" != *"UNEXPECTED_EDGE_CLEAN"* ]]
+    [[ "$output" != *"UNEXPECTED_EDGE_CLEAN"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_EDGE_UPDATER_CLEAN"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_BRAVE_CLEAN"* ]]
 }
 
 @test "old browser and updater cleanup continues on non-signal size failure and stops on signal" {
