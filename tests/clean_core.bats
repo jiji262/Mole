@@ -1440,12 +1440,13 @@ PLIST
     mkdir -p "$HOME/Library/Application Support/Code/CachedData"
     echo "cache" > "$HOME/Library/Application Support/Code/CachedData/data.bin"
 
+    set_mock_sudo_uncached
     set_mock_host_toolchains
     # Deduplication needs an idle fixture owner, independent of host editors.
     printf '#!/bin/bash\nexit 1\n' > "$MOCK_TOOLCHAIN_BIN/pgrep"
     chmod +x "$MOCK_TOOLCHAIN_BIN/pgrep"
-    run env HOME="$HOME" MOLE_TEST_MODE=0 \
-        PATH="$MOCK_TOOLCHAIN_BIN:$PATH" "$PROJECT_ROOT/mole" clean --dry-run
+    run env HOME="$HOME" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=1 \
+        PATH="$TEST_MOCK_BIN:$MOCK_TOOLCHAIN_BIN:$PATH" "$PROJECT_ROOT/mole" clean --dry-run
     [ "$status" -eq 0 ]
 
     run grep -c "Application Support/Code/CachedData" "$HOME/.config/mole/clean-list.txt"
@@ -2407,6 +2408,42 @@ EOF
     [[ "$output" == *"Idle Alpha"* ]] || return 1
     [[ "$output" == *"Nothing to clean"* ]] || return 1
     [[ "$output" != *"Category total"* ]] || return 1
+}
+
+@test "real-pipeline cases in this file never leave auth unguarded" {
+    # MOLE_TEST_MODE=0 runs the whole clean pipeline against the developer's
+    # machine. Only MOLE_TEST_NO_AUTH=1 keeps it off real credentials: without
+    # it, adopt_sudo_session runs `sudo -n -v` and starts a keepalive when the
+    # user happens to have a cached timestamp, and the orphan scan runs the real
+    # System Events AppleScript. --dry-run bounds deletions, not authorization.
+    # Join backslash-continued lines first: the env assignments and the mole
+    # invocation are usually written across two lines.
+    local report
+    report=$(/usr/bin/awk '
+        { line = line $0 }
+        /\\$/ { sub(/\\$/, "", line); next }
+        {
+            if (line ~ /MOLE_TEST_MODE=0/ && line ~ /PROJECT_ROOT\/mole" clean/) {
+                checked++
+                if (line !~ /MOLE_TEST_NO_AUTH=1/) {
+                    printf "UNGUARDED line %d:%s\n", NR, line
+                }
+            }
+            line = ""
+        }
+        END { printf "CHECKED:%d\n", checked + 0 }
+    ' "$BATS_TEST_FILENAME")
+
+    local checked="${report##*CHECKED:}"
+    # Positive control: the invariant must still be looking at real call sites.
+    [ "$checked" -ge 3 ] || {
+        echo "expected at least 3 real-pipeline cases, saw $checked"
+        return 1
+    }
+    [[ "$report" != *"UNGUARDED"* ]] || {
+        echo "$report"
+        return 1
+    }
 }
 
 @test "cleanup libs share one engine-absent shim instead of forking their own" {
