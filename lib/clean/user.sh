@@ -1223,7 +1223,7 @@ _chrome_extension_plan_targets() {
     for profile_dir in "${_MOLE_CHROME_EXT_PROFILES[@]}"; do
         rc=0
         _chrome_extension_plan_profile "$profile_dir" "$deadline" || rc=$?
-        if [[ $rc -eq 124 || $rc -ge 128 ]]; then
+        if mole_rc_timeout_or_signal "$rc"; then
             _MOLE_CHROME_EXT_TARGETS=()
             _MOLE_CHROME_EXT_PROFILE_STAMPS=()
             return "$rc"
@@ -1248,7 +1248,7 @@ _chrome_extension_delete_guard_allows() {
     fi
     local current="" rc=0
     current=$(_chrome_extension_prefs_stamp "$profile_dir") || rc=$?
-    [[ $rc -ne 124 && $rc -lt 128 ]] || return "$rc"
+    mole_rc_timeout_or_signal "$rc" && return "$rc"
     if [[ $rc -ne 0 || -z "$planned" || "$current" != "$planned" ]]; then
         _MOLE_CLEAN_GUARD_REASON="preferences changed"
         return 1
@@ -1290,7 +1290,7 @@ clean_chrome_extension_old_versions() {
     if [[ $plan_rc -ge 128 ]]; then
         _mole_record_clean_cancellation "$plan_rc"
         return "$plan_rc"
-    elif [[ $plan_rc -eq 124 ]]; then
+    elif mole_rc_timeout "$plan_rc"; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} ${label} · skipped (preferences read timed out)"
         note_activity
         return 0
