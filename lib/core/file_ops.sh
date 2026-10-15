@@ -317,9 +317,24 @@ _mole_load_process_table() {
         return 0
     fi
 
+    if ! _mole_read_process_table; then
+        _MOLE_PROCESS_TABLE_STATE="unavailable"
+        return 1
+    fi
+    _MOLE_PROCESS_TABLE="$_MOLE_PROCESS_TABLE_READ"
+    _MOLE_PROCESS_TABLE_STATE="ok"
+    return 0
+}
+
+# Read and filter one new ps snapshot into _MOLE_PROCESS_TABLE_READ. No memo:
+# the loader above caches its result, and a --fresh argv probe needs a table
+# taken now without disturbing that cache or the owner-state answers built on
+# it. Returns 1 when ps or the filter fails.
+_MOLE_PROCESS_TABLE_READ=""
+_mole_read_process_table() {
+    _MOLE_PROCESS_TABLE_READ=""
     local raw=""
     if ! raw=$(ps -axo pid,ppid,comm,args 2> /dev/null) || [[ -z "$raw" ]]; then
-        _MOLE_PROCESS_TABLE_STATE="unavailable"
         return 1
     fi
     # Before args, ps cuts comm to 16 bytes; as the LAST column it prints the
@@ -396,13 +411,100 @@ _mole_load_process_table() {
         }'); then
         # A filter that died mid-table would leave a SHORT table, which reads
         # as "nothing owns this cache". Refuse to answer instead.
-        _MOLE_PROCESS_TABLE_STATE="unavailable"
         return 1
     fi
 
-    _MOLE_PROCESS_TABLE="$filtered"
-    _MOLE_PROCESS_TABLE_STATE="ok"
+    _MOLE_PROCESS_TABLE_READ="$filtered"
     return 0
+}
+
+# Print the forms of an absolute path that a process argv may carry: the
+# lexical path and, when it differs, its physical path. Fails when the path is
+# not absolute, holds a control byte, or exists but cannot be resolved.
+_mole_argv_path_forms() {
+    local path="$1"
+    while [[ "$path" == */ && "$path" != "/" ]]; do
+        path="${path%/}"
+    done
+    [[ "$path" == /* && "$path" != "/" ]] || return 1
+    [[ ! "$path" =~ [[:cntrl:]] ]] || return 1
+    printf '%s\n' "$path"
+
+    local physical=""
+    if [[ -d "$path" ]]; then
+        physical=$(cd -P "$path" 2> /dev/null && pwd -P) || return 1
+    elif [[ -e "$path" || -L "$path" ]]; then
+        physical=$(cd -P "${path%/*}/" 2> /dev/null && pwd -P) || return 1
+        physical="${physical%/}/${path##*/}"
+    fi
+    [[ -z "$physical" || "$physical" == "$path" ]] || printf '%s\n' "$physical"
+}
+
+# Tri-state: does a line of this process table name any of the paths?
+# 0 = referenced, 1 = not referenced, 2 = could not tell.
+#
+# A literal byte match (awk index), never a pattern: cache paths carry '.',
+# '+', '[' and spaces, and backslash-escaping every byte for an ERE is
+# undefined. A hit counts only when a delimiter follows the path ('/',
+# whitespace, a quote, '=', a list separator ',', ':' or ';', the \037
+# executable separator, or end of line), so
+# .../_npx/abc is not read out of .../_npx/abcd, while --user-data-dir=<p>
+# still matches.
+mole_process_table_references_paths() {
+    local table="$1"
+    shift
+    [[ -n "$table" && $# -gt 0 ]] || return 2
+
+    local needles="" path forms=""
+    for path in "$@"; do
+        forms=$(_mole_argv_path_forms "$path") || return 2
+        needles+="${forms}"$'\n'
+    done
+
+    local rc=0
+    MOLE_ARGV_NEEDLES="$needles" LC_ALL=C awk '
+        BEGIN {
+            count = split(ENVIRON["MOLE_ARGV_NEEDLES"], needle, "\n")
+            delims = " \t\r\v\f/=,:;\"\047\037"
+            found = 0
+        }
+        {
+            for (i = 1; i <= count && !found; i++) {
+                if (needle[i] == "") continue
+                rest = $0
+                offset = index(rest, needle[i])
+                while (offset > 0) {
+                    after = substr(rest, offset + length(needle[i]), 1)
+                    if (after == "" || index(delims, after) > 0) { found = 1; break }
+                    rest = substr(rest, offset + 1)
+                    offset = index(rest, needle[i])
+                }
+            }
+            if (found) exit
+        }
+        END { exit(found ? 0 : 1) }
+    ' <<< "$table" || rc=$?
+    [[ $rc -le 1 ]] || return 2
+    return "$rc"
+}
+
+# Tri-state argv probe over the running process table (see above). Mole's own
+# process tree and the du/find children it forks are already dropped by the
+# table reader. --fresh takes a new ps snapshot for a deletion boundary and
+# leaves the memoized table and owner-state cache untouched. An unreadable or
+# empty table is 2, never "not referenced".
+# Usage: mole_process_args_reference_paths [--fresh] <path>...
+mole_process_args_reference_paths() {
+    local table=""
+    if [[ "${1:-}" == "--fresh" ]]; then
+        shift
+        _mole_read_process_table || return 2
+        table="$_MOLE_PROCESS_TABLE_READ"
+    else
+        _mole_load_process_table || return 2
+        table="$_MOLE_PROCESS_TABLE"
+    fi
+    mole_process_table_references_paths "$table" "$@"
 }
 
 # Escape the ERE metacharacters so a cache-dir component is matched as a
@@ -878,12 +980,506 @@ _mole_container_cache_has_open_handle() {
     return 1
 }
 
+# ----------------------------------------------------------------------------
+# Pending app updates inside the ~/Library/Caches sweep
+# ----------------------------------------------------------------------------
+# The sweep removes whole first-level entries, and two entry shapes hold a
+# downloaded app update rather than a cache:
+#   <id>.ShipIt/update.*/<Name>.app     Squirrel's staged bundle
+#   <name>-updater/pending/<file>.zip   electron-updater's staged download
+# A staged version newer than the installed app is a pending update the user
+# has not applied yet (measured: qoder-cn-updater 481 MB, org.tabby.ShipIt
+# 419 MB). Only a staged version at or below the uniquely installed same-id app
+# is superseded. Dot-less updater names never reached the reverse-DNS owner
+# probe, so their owner is the app whose Contents/Resources/app-update.yml
+# declares that exact updaterCacheDirName. Any unreadable fact is unknown and
+# keeps the entry; ShipItState.plist and the logs ride on the same decision.
+
+readonly MOLE_ELECTRON_UPDATER_CACHE_PATTERN='^@?[A-Za-z0-9._-]+-updater$'
+
+_MOLE_UPDATE_APP_BUNDLES=()
+_MOLE_UPDATE_APP_BUNDLES_STATE=""
+_MOLE_UPDATE_YML_INDEX=""
+_MOLE_UPDATE_YML_INDEX_STATE=""
+_MOLE_UPDATE_VERDICT_CACHE=""
+_MOLE_UPDATE_MATCHED_APPS=()
+_MOLE_UPDATE_STAGED_BUNDLE=""
+_MOLE_UPDATE_INSTALLED_ID=""
+_MOLE_UPDATE_INSTALLED_SHORT=""
+_MOLE_UPDATE_INSTALLED_BUILD=""
+
+# /Applications, replaced by MOLE_TEST_APPLICATIONS_DIR only under
+# MOLE_TEST_NO_AUTH=1 so fixtures never depend on the host's installed apps.
+_mole_update_system_app_root() {
+    if [[ "${MOLE_TEST_NO_AUTH:-}" == "1" && -n "${MOLE_TEST_APPLICATIONS_DIR:-}" ]]; then
+        printf '%s\n' "$MOLE_TEST_APPLICATIONS_DIR"
+        return 0
+    fi
+    printf '%s\n' "/Applications"
+}
+
+# Append the real (non-symlink) app bundles of one root. 1 = incomplete:
+# a symlinked root or more bundles than MOLE_UPDATE_APP_SCAN_MAX_BUNDLES.
+_mole_update_collect_app_bundles() {
+    local root="$1" nested="$2"
+    [[ ! -L "$root" ]] || return 1
+    [[ -d "$root" ]] || return 0
+    local restore_failglob=false
+    if shopt -q failglob; then
+        restore_failglob=true
+        shopt -u failglob
+    fi
+    local -a candidates=("$root"/*.app)
+    [[ "$nested" == "true" ]] && candidates+=("$root"/*/*.app)
+    [[ "$restore_failglob" == "true" ]] && shopt -s failglob
+
+    local app
+    for app in "${candidates[@]}"; do
+        [[ -d "$app" && ! -L "$app" && ! -L "${app%/*}" ]] || continue
+        [[ ${#_MOLE_UPDATE_APP_BUNDLES[@]} -lt $MOLE_UPDATE_APP_SCAN_MAX_BUNDLES ]] || return 1
+        _MOLE_UPDATE_APP_BUNDLES+=("$app")
+    done
+    return 0
+}
+
+# Installed bundles under /Applications/*.app, /Applications/*/*.app and
+# ~/Applications/*.app, memoized for the run. 1 = the scan is incomplete.
+_mole_update_app_bundles() {
+    if [[ -n "$_MOLE_UPDATE_APP_BUNDLES_STATE" ]]; then
+        [[ "$_MOLE_UPDATE_APP_BUNDLES_STATE" == "ok" ]]
+        return
+    fi
+    _MOLE_UPDATE_APP_BUNDLES_STATE="incomplete"
+    _MOLE_UPDATE_APP_BUNDLES=()
+    _mole_update_collect_app_bundles "$(_mole_update_system_app_root)" true || return 1
+    _mole_update_collect_app_bundles "$HOME/Applications" false || return 1
+    _MOLE_UPDATE_APP_BUNDLES_STATE="ok"
+}
+
+# One raw plist (or JSON) value from a regular, non-symlink file. Never
+# `plutil -p` (AGENTS.md). 1 = missing, unreadable, empty, or timed out.
+_mole_update_plist_value() {
+    local plist="$1" key="$2" value=""
+    [[ -f "$plist" && ! -L "$plist" ]] || return 1
+    value=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        plutil -extract "$key" raw -o - "$plist" < /dev/null 2> /dev/null) || return 1
+    [[ -n "$value" && "$value" != *$'\n'* ]] || return 1
+    printf '%s\n' "$value"
+}
+
+# Fill _MOLE_UPDATE_MATCHED_APPS with every installed bundle whose
+# CFBundleIdentifier is exactly $1. One bounded grep narrows the candidates
+# (bundle ids are ASCII, which binary plists store verbatim); plutil decides.
+# 1 = incomplete scan, an unreadable Info.plist, or a failed grep.
+_mole_update_apps_with_id() {
+    local bundle_id="$1"
+    _MOLE_UPDATE_MATCHED_APPS=()
+    _mole_update_app_bundles || return 1
+    local -a plists=()
+    local app plist
+    for app in ${_MOLE_UPDATE_APP_BUNDLES[@]+"${_MOLE_UPDATE_APP_BUNDLES[@]}"}; do
+        plist="$app/Contents/Info.plist"
+        # No Info.plist at all is not a Mac app bundle (iOS wrappers).
+        [[ -e "$plist" || -L "$plist" ]] || continue
+        [[ -f "$plist" && ! -L "$plist" && ! -L "$app/Contents" ]] || return 1
+        plists+=("$plist")
+    done
+    [[ ${#plists[@]} -gt 0 ]] || return 0
+
+    local hits="" grep_rc=0
+    hits=$(LC_ALL=C run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        grep -lF -- "$bundle_id" "${plists[@]}" < /dev/null 2> /dev/null) || grep_rc=$?
+    [[ $grep_rc -le 1 ]] || return 1
+    local id=""
+    while IFS= read -r plist; do
+        [[ -n "$plist" ]] || continue
+        id=$(_mole_update_plist_value "$plist" CFBundleIdentifier) || return 1
+        [[ "$id" == "$bundle_id" ]] || continue
+        _MOLE_UPDATE_MATCHED_APPS+=("${plist%/Contents/Info.plist}")
+    done <<< "$hits"
+    return 0
+}
+
+# Id and versions shared by every bundle in _MOLE_UPDATE_MATCHED_APPS.
+# 1 = no bundle, an unreadable value, or copies that disagree.
+_mole_update_installed_versions() {
+    _MOLE_UPDATE_INSTALLED_ID=""
+    _MOLE_UPDATE_INSTALLED_SHORT=""
+    _MOLE_UPDATE_INSTALLED_BUILD=""
+    [[ ${#_MOLE_UPDATE_MATCHED_APPS[@]} -gt 0 ]] || return 1
+    local app plist id short build first=true
+    for app in "${_MOLE_UPDATE_MATCHED_APPS[@]}"; do
+        plist="$app/Contents/Info.plist"
+        id=$(_mole_update_plist_value "$plist" CFBundleIdentifier) || return 1
+        short=$(_mole_update_plist_value "$plist" CFBundleShortVersionString) || return 1
+        build=$(_mole_update_plist_value "$plist" CFBundleVersion) || return 1
+        if [[ "$first" != "true" ]]; then
+            [[ "$id|$short|$build" == "$_MOLE_UPDATE_INSTALLED_ID|$_MOLE_UPDATE_INSTALLED_SHORT|$_MOLE_UPDATE_INSTALLED_BUILD" ]] ||
+                return 1
+        fi
+        first=false
+        _MOLE_UPDATE_INSTALLED_ID="$id"
+        _MOLE_UPDATE_INSTALLED_SHORT="$short"
+        _MOLE_UPDATE_INSTALLED_BUILD="$build"
+    done
+    mole_is_reverse_dns_bundle_id "$_MOLE_UPDATE_INSTALLED_ID"
+}
+
+# Staged versions against the installed ones set above.
+# 0 = newer on either key (pending), 1 = equal or older on both, 2 = unknown.
+_mole_update_versions_verdict() {
+    local staged_short="$1" staged_build="$2"
+    local short_rc=0 build_rc=0
+    mole_dotted_version_is_older "$_MOLE_UPDATE_INSTALLED_SHORT" "$staged_short" || short_rc=$?
+    mole_dotted_version_is_older "$_MOLE_UPDATE_INSTALLED_BUILD" "$staged_build" || build_rc=$?
+    [[ $short_rc -ne 2 && $build_rc -ne 2 ]] || return 2
+    [[ $short_rc -eq 1 && $build_rc -eq 1 ]] || return 0
+    return 1
+}
+
+# Staged Info.plist (id + versions) against _MOLE_UPDATE_MATCHED_APPS.
+# 0 = pending, 1 = superseded, 2 = unknown or a different app.
+_mole_update_plist_verdict() {
+    local plist="$1" bundle_id="$2"
+    _mole_update_installed_versions || return 2
+    [[ "$_MOLE_UPDATE_INSTALLED_ID" == "$bundle_id" ]] || return 2
+    local staged_id="" short="" build=""
+    staged_id=$(_mole_update_plist_value "$plist" CFBundleIdentifier) || return 2
+    [[ "$staged_id" == "$bundle_id" ]] || return 2
+    short=$(_mole_update_plist_value "$plist" CFBundleShortVersionString) || return 2
+    build=$(_mole_update_plist_value "$plist" CFBundleVersion) || return 2
+    _mole_update_versions_verdict "$short" "$build"
+}
+
+# A staged <Name>.app bundle against the uniquely installed same-id app. Shared
+# with the Application Support staged-update cleaner. Leaves the installed
+# copies in _MOLE_UPDATE_MATCHED_APPS for the caller's process probe.
+# 0 = pending, 1 = superseded, 2 = unknown.
+mole_staged_app_bundle_verdict() {
+    local staged="$1" bundle_id="$2"
+    _MOLE_UPDATE_MATCHED_APPS=()
+    mole_is_reverse_dns_bundle_id "$bundle_id" || return 2
+    [[ -d "$staged" && ! -L "$staged" ]] || return 2
+    [[ -d "$staged/Contents" && ! -L "$staged/Contents" ]] || return 2
+    _mole_update_apps_with_id "$bundle_id" || return 2
+    _mole_update_plist_verdict "$staged/Contents/Info.plist" "$bundle_id"
+}
+
+# Tri-state owner probe: 0 = running, 1 = idle, 2 = unknown. The reverse-DNS
+# probe runs first; then a fresh argv probe on the cache dir (ShipIt and
+# electron installers launch from it) and on each '<app>/Contents'.
+_mole_update_owner_process_state() {
+    local owner_id="$1" cache_dir="$2"
+    shift 2
+    local state=0
+    if [[ -n "$owner_id" ]]; then
+        _mole_user_cache_owner_process_state "$owner_id" || state=$?
+        [[ $state -eq 1 ]] || return "$state"
+    fi
+    local -a probe_paths=("$cache_dir")
+    local app
+    for app in "$@"; do
+        probe_paths+=("$app/Contents")
+    done
+    state=0
+    mole_process_args_reference_paths --fresh "${probe_paths[@]}" || state=$?
+    [[ $state -le 1 ]] || return 2
+    return "$state"
+}
+
+# Exactly one real update.*/<Name>.app below a ShipIt cache, into
+# _MOLE_UPDATE_STAGED_BUNDLE. 0 = found, 3 = nothing staged, 2 = ambiguous or
+# a symlink on the way.
+_mole_shipit_staged_bundle() {
+    local cache_dir="$1"
+    _MOLE_UPDATE_STAGED_BUNDLE=""
+    [[ -e "$cache_dir" || -L "$cache_dir" ]] || return 3
+    [[ -d "$cache_dir" && ! -L "$cache_dir" ]] || return 2
+    local restore_failglob=false
+    if shopt -q failglob; then
+        restore_failglob=true
+        shopt -u failglob
+    fi
+    local -a staged=("$cache_dir"/update.*/*.app)
+    local -a entries=("$cache_dir"/update.*)
+    [[ "$restore_failglob" == "true" ]] && shopt -s failglob
+
+    local entry count=0
+    for entry in "${entries[@]}"; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        [[ -d "$entry" && ! -L "$entry" ]] || return 2
+    done
+    for entry in "${staged[@]}"; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        [[ -d "$entry" && ! -L "$entry" ]] || return 2
+        _MOLE_UPDATE_STAGED_BUNDLE="$entry"
+        count=$((count + 1))
+    done
+    [[ $count -gt 0 ]] || return 3
+    [[ $count -eq 1 ]] || return 2
+    return 0
+}
+
+# <id>.ShipIt: 0 = keep (pending or owner running), 1 = no objection,
+# 2 = unknown. Nothing staged keeps today's reverse-DNS owner probe.
+_mole_shipit_cache_pending_state() {
+    local cache_dir="$1" bundle_id="$2"
+    local staged_rc=0
+    _mole_shipit_staged_bundle "$cache_dir" || staged_rc=$?
+    [[ $staged_rc -ne 3 ]] || return 1
+    [[ $staged_rc -eq 0 ]] || return 2
+
+    local verdict=0
+    mole_staged_app_bundle_verdict "$_MOLE_UPDATE_STAGED_BUNDLE" "$bundle_id" || verdict=$?
+    [[ $verdict -ne 0 ]] || return 0
+    [[ $verdict -eq 1 ]] || return 2
+    local process_state=0
+    _mole_update_owner_process_state "$bundle_id" "$cache_dir" \
+        "${_MOLE_UPDATE_MATCHED_APPS[@]}" || process_state=$?
+    [[ $process_state -ne 0 ]] || return 0
+    [[ $process_state -eq 1 ]] || return 2
+    return 1
+}
+
+# updaterCacheDirName from one app-update.yml, YAML (`key: value`) or JSON-like
+# (`"key": "value",`). Prints nothing when the key is absent.
+# 1 = symlink, not a regular file, larger than MOLE_UPDATE_YML_MAX_BYTES, or
+# an unreadable file.
+_mole_update_yml_cache_dir_name() {
+    local yml="$1" size="" content=""
+    [[ -f "$yml" && ! -L "$yml" ]] || return 1
+    size=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "$STAT_BSD" -f %z "$yml" < /dev/null 2> /dev/null) || return 1
+    [[ "$size" =~ ^[0-9]+$ && $size -le $MOLE_UPDATE_YML_MAX_BYTES ]] || return 1
+    content=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        head -c "$MOLE_UPDATE_YML_MAX_BYTES" "$yml" < /dev/null 2> /dev/null) || return 1
+
+    local key_pattern='^[[:space:]]*"?updaterCacheDirName"?[[:space:]]*:[[:space:]]*(.*)$'
+    local line value
+    while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        [[ "$line" =~ $key_pattern ]] || continue
+        value="${BASH_REMATCH[1]}"
+        value="${value%"${value##*[![:space:]]}"}"
+        value="${value%,}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 && ("$value" == \"*\" || "$value" == \'*\') ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+        printf '%s\n' "$value"
+    done <<< "$content"
+    return 0
+}
+
+# "<updaterCacheDirName>\t<app>" lines for every installed app-update.yml,
+# memoized for the run. 1 = incomplete scan or a yml that could not be read.
+_mole_update_yml_index_load() {
+    if [[ -n "$_MOLE_UPDATE_YML_INDEX_STATE" ]]; then
+        [[ "$_MOLE_UPDATE_YML_INDEX_STATE" == "ok" ]]
+        return
+    fi
+    _MOLE_UPDATE_YML_INDEX_STATE="incomplete"
+    _MOLE_UPDATE_YML_INDEX=""
+    _mole_update_app_bundles || return 1
+    local app yml names name index=""
+    for app in ${_MOLE_UPDATE_APP_BUNDLES[@]+"${_MOLE_UPDATE_APP_BUNDLES[@]}"}; do
+        yml="$app/Contents/Resources/app-update.yml"
+        [[ -e "$yml" || -L "$yml" ]] || continue
+        names=$(_mole_update_yml_cache_dir_name "$yml") || return 1
+        while IFS= read -r name; do
+            [[ -n "$name" && "$name" != *$'\t'* ]] || continue
+            index+="${name}"$'\t'"${app}"$'\n'
+        done <<< "$names"
+    done
+    _MOLE_UPDATE_YML_INDEX="$index"
+    _MOLE_UPDATE_YML_INDEX_STATE="ok"
+}
+
+# Apps declaring updaterCacheDirName byte-equal to $1, into
+# _MOLE_UPDATE_MATCHED_APPS. 1 = the owner scan is incomplete.
+_mole_update_owner_apps_for_cache_name() {
+    local cache_name="$1" line
+    _MOLE_UPDATE_MATCHED_APPS=()
+    _mole_update_yml_index_load || return 1
+    while IFS= read -r line; do
+        [[ -n "$line" && "${line%%$'\t'*}" == "$cache_name" ]] || continue
+        _MOLE_UPDATE_MATCHED_APPS+=("${line#*$'\t'}")
+    done <<< "$_MOLE_UPDATE_YML_INDEX"
+    return 0
+}
+
+# The single ^[^/]+\.app/Contents/Info\.plist$ entry of an update zip. 1 = a
+# failed or timed-out listing, zero or several matches, or a name unzip would
+# read as a pattern or an option.
+_mole_update_zip_info_plist_entry() {
+    local zip="$1" listing="" plist_entries=""
+    listing=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        zipinfo -1 "$zip" < /dev/null 2> /dev/null) || return 1
+    plist_entries=$(LC_ALL=C grep -E '^[^/]+\.app/Contents/Info\.plist$' <<< "$listing") || return 1
+    [[ -n "$plist_entries" && "$plist_entries" != *$'\n'* ]] || return 1
+    case "$plist_entries" in
+        -* | *'['* | *'*'* | *'?'* | *\\*) return 1 ;;
+    esac
+    printf '%s\n' "$plist_entries"
+}
+
+# Verdict for electron-updater's pending/ download: 0 = pending, 1 =
+# superseded, 2 = unknown. Expects the owner's versions already loaded.
+# Memoized per run by cache name, zip identity and installed versions.
+_mole_electron_pending_verdict() {
+    local cache_dir="$1" cache_name="$2"
+    local pending="$cache_dir/pending"
+    [[ -d "$pending" && ! -L "$pending" ]] || return 2
+    local file_name=""
+    file_name=$(_mole_update_plist_value "$pending/update-info.json" fileName) || return 2
+    [[ "$file_name" == *.zip && "$file_name" != */* && "$file_name" != .* ]] || return 2
+    local zip="$pending/$file_name" zip_identity=""
+    [[ -f "$zip" && ! -L "$zip" ]] || return 2
+    zip_identity=$(mole_deletion_identity "$zip") || return 2
+
+    local memo_key="|${cache_name}@${zip_identity}@${_MOLE_UPDATE_INSTALLED_SHORT}@${_MOLE_UPDATE_INSTALLED_BUILD}="
+    case "$_MOLE_UPDATE_VERDICT_CACHE" in
+        *"${memo_key}0|"*) return 0 ;;
+        *"${memo_key}1|"*) return 1 ;;
+        *"${memo_key}2|"*) return 2 ;;
+    esac
+    local verdict=0
+    _mole_update_zip_verdict "$zip" || verdict=$?
+    [[ $verdict -le 2 ]] || verdict=2
+    _MOLE_UPDATE_VERDICT_CACHE+="${memo_key}${verdict}|"
+    return "$verdict"
+}
+
+# Read the staged Info.plist out of the zip (size-capped) and compare it with
+# the owner. 0 = pending, 1 = superseded, 2 = unknown.
+_mole_update_zip_verdict() {
+    local zip="$1" entry="" scratch=""
+    entry=$(_mole_update_zip_info_plist_entry "$zip") || return 2
+    scratch=$(create_temp_file 2> /dev/null) || return 2
+    local extract_rc=0
+    (
+        set -o pipefail
+        run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+            unzip -p "$zip" "$entry" < /dev/null 2> /dev/null |
+            head -c "$MOLE_UPDATE_PLIST_MAX_BYTES" > "$scratch"
+    ) || extract_rc=$?
+    local verdict=2
+    if [[ $extract_rc -eq 0 ]]; then
+        verdict=0
+        _mole_update_plist_verdict "$scratch" "$_MOLE_UPDATE_INSTALLED_ID" || verdict=$?
+    fi
+    rm -f -- "$scratch" 2> /dev/null || true # SAFE: exact tracked temp file created above
+    return "$verdict"
+}
+
+# <name>-updater: 0 = keep (pending or owner running), 1 = no objection,
+# 2 = unknown. An owner-unknown cache keeps today's behaviour unless it holds
+# pending/, which may be the only copy of a downloaded update.
+_mole_electron_updater_pending_state() {
+    local cache_dir="$1" cache_name="$2"
+    _mole_update_owner_apps_for_cache_name "$cache_name" || return 2
+    local has_pending=false
+    [[ -e "$cache_dir/pending" || -L "$cache_dir/pending" ]] && has_pending=true
+    if [[ ${#_MOLE_UPDATE_MATCHED_APPS[@]} -eq 0 ]]; then
+        [[ "$has_pending" != "true" ]] || return 2
+        return 1
+    fi
+    _mole_update_installed_versions || return 2
+
+    local process_state=0
+    _mole_update_owner_process_state "$_MOLE_UPDATE_INSTALLED_ID" "$cache_dir" \
+        "${_MOLE_UPDATE_MATCHED_APPS[@]}" || process_state=$?
+    [[ $process_state -ne 0 ]] || return 0
+    [[ $process_state -eq 1 ]] || return 2
+    [[ "$has_pending" == "true" ]] || return 1
+
+    local verdict=0
+    _mole_electron_pending_verdict "$cache_dir" "$cache_name" || verdict=$?
+    [[ $verdict -ne 0 ]] || return 0
+    [[ $verdict -eq 1 ]] || return 2
+    return 1
+}
+
+# Chromium forks keep their disk cache in ~/Library/Caches/<product name>,
+# a dot-less name the reverse-DNS scope never sees. Exact name|bundle id
+# pairs only: no globs, no vendor prefixes. The name is also the app bundle's
+# name, because Chromium helpers carry neither the bundle id nor a token that
+# corroborates it (a running Tabbit is only /Tabbit.app/Contents/... in argv).
+readonly MOLE_DOTLESS_CACHE_OWNER_MAP=(
+    "Tabbit|com.tabbit-ai.Tabbit"
+)
+
+# Bundle id mapped to an exact dot-less cache name. 1 = not mapped.
+_mole_dotless_cache_owner_id() {
+    local name="$1" entry
+    for entry in "${MOLE_DOTLESS_CACHE_OWNER_MAP[@]}"; do
+        [[ "${entry%%|*}" == "$name" ]] || continue
+        printf '%s\n' "${entry#*|}"
+        return 0
+    done
+    return 1
+}
+
+# 0 = the owner runs, 1 = idle, 2 = unknown. The reverse-DNS owner probe
+# first, then a literal /<name>.app/Contents/ on a fresh process snapshot:
+# this also runs at the deletion sink, where the run's memoized table can
+# predate a browser the user started since.
+_mole_dotless_cache_owner_state() {
+    local app_name="$1" owner_id="$2" state=0
+    _mole_user_cache_owner_process_state "$owner_id" || state=$?
+    [[ $state -eq 1 ]] || return "$state"
+    _mole_read_process_table || return 2
+    if LC_ALL=C grep -qF -- "/${app_name}.app/Contents/" <<< "$_MOLE_PROCESS_TABLE_READ"; then
+        return 0
+    fi
+    return 1
+}
+
+# Single hook for _mole_should_refuse_live_user_cache_path. Applies only at or
+# below ~/Library/Caches/<component> where the component ends in .ShipIt, is
+# in MOLE_DOTLESS_CACHE_OWNER_MAP, or is an electron-updater name.
+# 0 = keep, 1 = no objection, 2 = unknown (keep).
+# Uninstall queues these caches as leftovers of the app it removes, so "no
+# installed owner" is the expected state there rather than an unknown one; a
+# staged update has nothing left to apply to. Only the clean sweep consults it.
+_mole_user_cache_pending_update_state() {
+    [[ "${MOLE_UNINSTALL_MODE:-0}" != "1" ]] || return 1
+    local path="${1%/}"
+    local caches_root="${HOME%/}/Library/Caches"
+    case "$path" in
+        "$caches_root"/*) ;;
+        *) return 1 ;;
+    esac
+    local component="${path#"$caches_root"/}"
+    component="${component%%/*}"
+    local cache_dir="$caches_root/$component"
+    if [[ "$component" == *.ShipIt ]]; then
+        _mole_shipit_cache_pending_state "$cache_dir" "${component%.ShipIt}"
+        return
+    fi
+    local dotless_owner=""
+    if dotless_owner=$(_mole_dotless_cache_owner_id "$component"); then
+        _mole_dotless_cache_owner_state "$component" "$dotless_owner"
+        return
+    fi
+    [[ "$component" =~ $MOLE_ELECTRON_UPDATER_CACHE_PATTERN ]] || return 1
+    _mole_electron_updater_pending_state "$cache_dir" "$component"
+}
+
 # Return 0 when deletion must be refused (live owner or open cache handle).
 _mole_should_refuse_live_user_cache_path() {
     local path="$1"
     _MOLE_CONTAINER_CACHE_PROBE_PARENT=""
     _MOLE_CONTAINER_CACHE_PROBE_PARENT_ID=""
     _MOLE_CONTAINER_CACHE_PROBE_TARGET_ID=""
+    # Staged app updates and dot-less updater caches first: the reverse-DNS
+    # scope below never sees a name without a dot.
+    local pending_update_state=0
+    _mole_user_cache_pending_update_state "$path" || pending_update_state=$?
+    if [[ $pending_update_state -ne 1 ]]; then
+        debug_log "Pending app update or updater owner not conclusively idle, keep: $path"
+        return 0
+    fi
     local scope=""
     scope=$(_mole_user_cache_scope "$path") || return 1
     local owner="${scope%%|*}"

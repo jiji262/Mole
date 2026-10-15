@@ -1,6 +1,7 @@
 #!/bin/bash
 # Mole - Installer command
-# Find and remove installer files - .dmg, .pkg, .mpkg, .iso, .xip, .zip
+# Find and remove installer files - .dmg, .pkg, .mpkg, .iso, .xip, .zip,
+# Windows .exe/.msi, and stale browser partial downloads
 
 set -euo pipefail
 
@@ -50,8 +51,24 @@ readonly INSTALLER_SCAN_PATHS=(
     "$HOME/Library/Containers/com.apple.mail/Data/Library/Mail Downloads"
     "$HOME/Library/Application Support/Telegram Desktop"
     "$HOME/Downloads/Telegram Desktop"
+    "$HOME/Library/Parallels/Downloads"
+)
+# Download-origin roots. A Windows .exe/.msi has no installer evidence of its
+# own, so it is offered only from here; under Documents, Desktop, Public,
+# /Users/Shared or an app's data folder it may be a portable tool or a VM's
+# own file, not a leftover download.
+readonly INSTALLER_DOWNLOAD_ROOTS=(
+    "$HOME/Downloads"
+    "$HOME/Library/Downloads"
+    "/Users/Shared/Downloads"
+    "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Downloads"
+    "$HOME/Library/Containers/com.apple.mail/Data/Library/Mail Downloads"
+    "$HOME/Library/Parallels/Downloads"
 )
 readonly MAX_ZIP_ENTRIES=50
+readonly INSTALLER_SECONDS_PER_DAY=86400
+# fd matches this against the file name; handle_candidate_file re-checks it.
+readonly INSTALLER_FD_NAME_PATTERN='\.(dmg|pkg|mpkg|iso|xip|zip|exe|msi|crdownload)$|^\.com\.google\.Chrome\.[A-Za-z0-9]{6}$'
 readonly INSTALLER_EXIT_INCOMPLETE=3
 readonly INSTALLER_EXIT_SCAN_FAILED=4
 INSTALLER_SCAN_FAILURE_PATH=""
@@ -93,32 +110,81 @@ is_installer_zip() {
     return "$rc"
 }
 
+# Chrome-family in-progress downloads: *.crdownload and Chrome's dot-prefixed
+# temp name. A fresh one may still be downloading or paused for resume.
+installer_is_partial_download() {
+    local name="${1##*/}"
+    [[ "$name" == *.crdownload ]] && return 0
+    [[ "$name" =~ ^\.com\.google\.Chrome\.[A-Za-z0-9]{6}$ ]]
+}
+
+# Print a file's age in seconds. A future or unreadable mtime is unknown.
+installer_file_age_seconds() {
+    local file_path="$1"
+    local mtime duration now
+
+    duration=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" "${2:-}") || return $?
+    mtime=$(run_with_timeout "$duration" "$STAT_BSD" -f%m "$file_path" < /dev/null 2> /dev/null) || return $?
+    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s)
+    [[ $mtime -le $now ]] || return 1
+    printf '%s\n' "$((now - mtime))"
+}
+
+# 0 only when the partial download is older than MOLE_TEMP_FILE_AGE_DAYS;
+# 1 when it is fresh or its age is unknown; other statuses are timeouts/signals.
+installer_partial_download_is_stale() {
+    local age rc=0
+    age=$(installer_file_age_seconds "$1" "${2:-}") || rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    [[ $age -gt $((MOLE_TEMP_FILE_AGE_DAYS * INSTALLER_SECONDS_PER_DAY)) ]]
+}
+
+# One slow candidate (an iCloud file that has to download first, or a huge
+# ZIP listing) is skipped like an unreadable one. Only the shared deadline or
+# a signal stops the scan.
+installer_candidate_skippable() {
+    local rc="$1"
+    [[ $rc -eq 1 ]] && return 0
+    if mole_rc_timeout "$rc" && _mole_timeout_with_deadline 1 "${2:-}" > /dev/null; then
+        return 0
+    fi
+    return "$rc"
+}
+
+# 0 when the file lies below one of INSTALLER_DOWNLOAD_ROOTS.
+installer_in_download_root() {
+    local file="$1" root
+    for root in "${INSTALLER_DOWNLOAD_ROOTS[@]}"; do
+        [[ "$file" == "$root"/* ]] && return 0
+    done
+    return 1
+}
+
 handle_candidate_file() {
     local file="$1"
+    local probe_rc=0
 
     [[ -L "$file" ]] && return 0 # Skip symlinks explicitly
+    if installer_is_partial_download "$file"; then
+        installer_partial_download_is_stale "$file" "${2:-}" || probe_rc=$?
+        [[ $probe_rc -eq 0 ]] || installer_candidate_skippable "$probe_rc" "${2:-}" || return $?
+        [[ $probe_rc -ne 0 ]] || printf '%s\0' "$file"
+        return 0
+    fi
     case "$file" in
         *.dmg | *.pkg | *.mpkg | *.iso | *.xip)
             printf '%s\0' "$file"
             ;;
+        *.exe | *.msi)
+            installer_in_download_root "$file" || return 0
+            printf '%s\0' "$file"
+            ;;
         *.zip)
             [[ -r "$file" ]] || return 0
-            local zip_rc=0
-            is_installer_zip "$file" "${2:-}" 2> /dev/null || zip_rc=$?
-            case "$zip_rc" in
-                0) printf '%s\0' "$file" ;;
-                1) return 0 ;;
-                *)
-                    # One slow archive (an iCloud file that has to download
-                    # first, or a huge listing) is skipped like an unreadable
-                    # one. Only the shared deadline or a signal stops the scan.
-                    if mole_rc_timeout "$zip_rc" &&
-                        _mole_timeout_with_deadline 1 "${2:-}" > /dev/null; then
-                        return 0
-                    fi
-                    return "$zip_rc"
-                    ;;
-            esac
+            is_installer_zip "$file" "${2:-}" 2> /dev/null || probe_rc=$?
+            [[ $probe_rc -eq 0 ]] || installer_candidate_skippable "$probe_rc" "${2:-}" || return $?
+            [[ $probe_rc -ne 0 ]] || printf '%s\0' "$file"
             ;;
     esac
 }
@@ -147,12 +213,14 @@ scan_installers_in_path() {
     if [[ $scan_rc -eq 0 ]]; then
         local -a scan_command=()
         if command -v fd > /dev/null 2>&1; then
-            scan_command=(fd --show-errors --print0 --no-ignore --hidden --type f --max-depth "$max_depth"
-                -e dmg -e pkg -e mpkg -e iso -e xip -e zip . "$path")
+            scan_command=(fd --show-errors --print0 --no-ignore --hidden --case-sensitive
+                --type f --max-depth "$max_depth" "$INSTALLER_FD_NAME_PATTERN" "$path")
         else
             scan_command=(find -H "$path" -maxdepth "$max_depth" -type f
                 \( -name '*.dmg' -o -name '*.pkg' -o -name '*.mpkg'
-                -o -name '*.iso' -o -name '*.xip' -o -name '*.zip' \) -print0)
+                -o -name '*.iso' -o -name '*.xip' -o -name '*.zip'
+                -o -name '*.exe' -o -name '*.msi' -o -name '*.crdownload'
+                -o -name '.com.google.Chrome.??????' \) -print0)
         fi
         # Redirect only the producer's diagnostics; the timeout supervisor owns
         # its stderr, including debug traces. exec preserves the producer status.
@@ -241,6 +309,7 @@ get_source_display() {
         "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Downloads"*) echo "iCloud" ;;
         "$HOME/Library/Containers/com.apple.mail"*) echo "Mail" ;;
         *"Telegram Desktop"*) echo "Telegram" ;;
+        "$HOME/Library/Parallels"*) echo "Parallels" ;;
         *) echo "${dir_path##*/}" ;;
     esac
 }
@@ -266,6 +335,7 @@ format_installer_display() {
     local filename="$1"
     local size_str="$2"
     local source="$3"
+    local kind="${4:-}"
 
     filename=$(installer_display_text "$filename")
     source=$(installer_display_text "$source")
@@ -299,8 +369,28 @@ format_installer_display() {
     local padding=$((available_width - current_width))
     local printf_width=$((byte_count + padding))
 
-    # Format: "filename  size | source"
+    # Format: "filename  size | source  kind"
     printf "%-*s %8s | %-10s" "$printf_width" "$truncated_name" "$size_str" "$source"
+    [[ -z "$kind" ]] || printf ' %s' "$kind"
+}
+
+# Menu label for candidates that are not macOS installers, so a partial
+# download or a Windows file is never mistaken for a .dmg.
+installer_candidate_kind() {
+    local file_path="$1"
+    local age
+
+    if installer_is_partial_download "$file_path"; then
+        age=$(installer_file_age_seconds "$file_path" "${2:-}") || return $?
+        printf 'Partial download · %sd\n' "$((age / INSTALLER_SECONDS_PER_DAY))"
+        return 0
+    fi
+    # .msi is the Windows Installer package format; an .exe may as well be a
+    # portable tool, so it is not called an installer.
+    case "$file_path" in
+        *.msi) printf 'Windows installer\n' ;;
+        *.exe) printf 'Windows executable\n' ;;
+    esac
 }
 
 # Publish complete installer metadata: 0 success, 1 empty, 4 scan failure,
@@ -377,6 +467,13 @@ collect_installers() {
             break
         }
 
+        local kind
+        kind=$(installer_candidate_kind "$file" "$deadline") || {
+            scan_rc=$?
+            INSTALLER_SCAN_FAILURE_PATH="$file"
+            break
+        }
+
         # Get source directory
         local source
         source=$(get_source_display "$file")
@@ -398,7 +495,7 @@ collect_installers() {
 
         # Format display with alignment
         local display
-        display=$(format_installer_display "$display_name" "$size_human" "$source")
+        display=$(format_installer_display "$display_name" "$size_human" "$source" "$kind")
 
         # Store installer data in parallel arrays
         sizes+=("$file_size")
@@ -696,6 +793,14 @@ installer_file_size_bytes() {
     printf '%s\n' "$file_size"
 }
 
+# A partial download must still be stale once the plan binds its identity;
+# that identity then pins the mtime through the final sink.
+installer_plan_partial_download_ok() {
+    local file_path="$1"
+    installer_is_partial_download "$file_path" || return 0
+    installer_partial_download_is_stale "$file_path" "${2:-}"
+}
+
 build_installer_delete_plan() {
     reset_installer_delete_plan
 
@@ -720,6 +825,16 @@ build_installer_delete_plan() {
             if mole_rc_timeout_or_signal "$identity_rc"; then
                 reset_installer_delete_plan
                 return "$identity_rc"
+            fi
+            continue
+        fi
+        local stale_rc=0
+        installer_plan_partial_download_ok "$file_path" "$deadline" || stale_rc=$?
+        if [[ $stale_rc -ne 0 ]]; then
+            record_installer_delete_failure "$file_path" "changed since scan"
+            if mole_rc_timeout_or_signal "$stale_rc"; then
+                reset_installer_delete_plan
+                return "$stale_rc"
             fi
             continue
         fi

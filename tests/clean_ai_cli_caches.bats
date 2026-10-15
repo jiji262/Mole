@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 load helpers/common
+load helpers/fork_caches
 
 setup_file() {
     mole_test_setup_home ai-cli-caches
@@ -1713,4 +1714,749 @@ EOF
     assert_run_success
     assert_output_contains "AGENT_BROWSER_UNKNOWN_KEPT"
     assert_output_contains "agent-browser old Chrome · stopped (process state unknown)"
+}
+
+# Claude Code and Codex disposable state. Deletion authority is evidence the
+# owner wrote itself: Claude Code's .orphaned_at marker, a config temp whose
+# writer pid is gone, or an empty Codex temp skeleton. Each case runs in its own
+# HOME and reaches the real sink through bin/clean.sh.
+ai_state_case_home() {
+    local case_home="$HOME/ai-state-$BATS_TEST_NUMBER"
+    rm -rf "$case_home"
+    mkdir -p "$case_home"
+    printf '%s\n' "$case_home"
+}
+
+ai_state_age_tree() {
+    local old_stamp
+    old_stamp=$(date -v-30d +%Y%m%d%H%M)
+    find "$1" -exec touch -h -t "$old_stamp" {} +
+}
+
+# ps double: `-p <pid>` answers from $HOME/ps-alive (or fails when
+# $HOME/ps-error exists); the argv table names every path in $HOME/ps-busy.
+ai_state_fake_ps_body() {
+    cat << 'BODY'
+if [[ "${1:-}" == "-p" ]]; then
+    [[ -f "$HOME/ps-error" ]] && { echo "ps: broken" >&2; exit 2; }
+    if [[ -f "$HOME/ps-alive" ]] && grep -qx "$2" "$HOME/ps-alive"; then
+        printf '%5s\n' "$2"
+        exit 0
+    fi
+    exit 1
+fi
+[[ "$*" == *args* ]] || exit 0
+printf '  PID  PPID COMM ARGS\n'
+printf '  100     1 launchd /sbin/launchd\n'
+if [[ -f "$HOME/ps-busy" ]]; then
+    while IFS= read -r busy; do
+        printf '  4242     1 node node %s\n' "$busy"
+    done < "$HOME/ps-busy"
+fi
+BODY
+}
+
+# Usage: ai_state_run <case_home> <function> [prelude]
+ai_state_run() {
+    local case_home="$1"
+    local call="$2"
+    local prelude="${3:-}"
+    mole_test_fake_command ps "$(ai_state_fake_ps_body)"
+    run env -u CLAUDE_CONFIG_DIR HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_TEST_NO_AUTH=1 AI_STATE_CALL="$call" AI_STATE_PRELUDE="$prelude" \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+pgrep() { return 1; }
+eval "$AI_STATE_PRELUDE"
+"$AI_STATE_CALL"
+EOF
+}
+
+# cache/m/p/old carries an orphan marker from 30 days ago; cache/m/p/new is the
+# registered installPath. Every file is aged 30 days.
+claude_plugin_fixture() {
+    local case_home="$1"
+    local marker="${2:-}"
+    local plugins="$case_home/.claude/plugins"
+    mkdir -p "$plugins/cache/m/p/old" "$plugins/cache/m/p/new" \
+        "$plugins/marketplaces/m" "$plugins/data/p"
+    printf 'old\n' > "$plugins/cache/m/p/old/server.js"
+    printf 'new\n' > "$plugins/cache/m/p/new/server.js"
+    printf 'state\n' > "$plugins/data/p/state.json"
+    if [[ -z "$marker" ]]; then
+        marker="$(($(date -v-30d +%s) * 1000))"
+    fi
+    printf '%s' "$marker" > "$plugins/cache/m/p/old/.orphaned_at"
+    printf '{"version":2,"plugins":{"p@m":[{"scope":"user","installPath":"%s","version":"new"}]}}\n' \
+        "$plugins/cache/m/p/new" > "$plugins/installed_plugins.json"
+    ai_state_age_tree "$plugins"
+}
+
+@test "claude orphan plugin version with an aged marker is removed" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$cache/old" ] || { echo "$output"; return 1; }
+    [ -f "$cache/new/server.js" ] || return 1
+    [ -f "$case_home/.claude/plugins/installed_plugins.json" ] || return 1
+    [ -f "$case_home/.claude/plugins/data/p/state.json" ] || return 1
+    [ -d "$case_home/.claude/plugins/marketplaces/m" ] || return 1
+    [[ "$output" == *"Claude Code orphaned plugin versions"* ]]
+}
+
+@test "claude orphan plugin version keeps an orphan version referenced by a running MCP" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+    printf '%s\n' "$cache/old/server.js" > "$case_home/ps-busy"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER=Claude Code plugins"* ]]
+}
+
+@test "claude orphan plugin version keeps when the marker is younger than 7d" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home" "$(($(date -v-2d +%s) * 1000))"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [[ "$output" != *"Claude Code orphaned plugin versions"* ]]
+}
+
+@test "claude orphan plugin version keeps when the marker mtime is fresh" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+    touch "$cache/old/.orphaned_at"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+}
+
+@test "claude orphan plugin version keeps when the marker content is not numeric" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home" "yesterday"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+}
+
+@test "claude orphan plugin version keeps a marked dir that is still an installPath" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+    printf '{"version":2,"plugins":{"p@m":[{"installPath":"%s"},{"installPath":"%s"}]}}\n' \
+        "$cache/new" "$cache/old" > "$case_home/.claude/plugins/installed_plugins.json"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+}
+
+@test "claude orphan plugin version keeps everything when installed_plugins.json is malformed" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+    printf '{"version":2,"plugins":{' > "$case_home/.claude/plugins/installed_plugins.json"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Claude Code plugin cache · stopped (plugin registry unreadable)"* ]]
+}
+
+@test "claude orphan plugin version keeps everything when the registry lists no installPath" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+    printf '{"version":3,"plugins":{"p@m":[{"scope":"user","install_path":"%s"}]}}\n' \
+        "$cache/new" > "$case_home/.claude/plugins/installed_plugins.json"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Claude Code plugin cache · stopped (plugin registry unreadable)"* ]]
+}
+
+@test "claude orphan plugin version rejects a symlinked plugin level" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local outside="$case_home/outside-plugin"
+    mv "$case_home/.claude/plugins/cache/m/p" "$outside"
+    ln -s "$outside" "$case_home/.claude/plugins/cache/m/p"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$outside/old/server.js" ] || { echo "$output"; return 1; }
+    [ -f "$outside/old/.orphaned_at" ] || return 1
+    # Rejected at the scan, before the sink's own containment check.
+    [[ "$output" != *"stopped"* ]]
+}
+
+@test "claude orphan plugin version whitelist of ~/.claude keeps it" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+
+    # shellcheck disable=SC2016 # The prelude is evaluated by the child shell.
+    ai_state_run "$case_home" clean_claude_plugin_orphans 'WHITELIST_PATTERNS=("$HOME/.claude")'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+}
+
+@test "claude orphan plugin version keeps when the marker is replaced before the sink" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+
+    # Swap in a new, equally old marker right before the deletion boundary.
+    # shellcheck disable=SC2016 # The prelude is evaluated by the child shell.
+    ai_state_run "$case_home" clean_claude_plugin_orphans '
+eval "_ai_state_orig_guard() $(declare -f _dev_process_delete_guard_allows | tail -n +2)"
+_dev_process_delete_guard_allows() {
+    if [[ -n "${1:-}" ]]; then
+        printf "%s" "$(($(date -v-20d +%s) * 1000))" > "$1/.orphaned_at.new"
+        mv "$1/.orphaned_at.new" "$1/.orphaned_at"
+        touch -t "$(date -v-30d +%Y%m%d%H%M)" "$1/.orphaned_at"
+    fi
+    _ai_state_orig_guard "$@"
+}'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"stopped (process or cache path state unknown)"* ]]
+}
+
+# Prelude: right before the deletion boundary, replace installed_plugins.json
+# with the staged installed_plugins.next.
+# shellcheck disable=SC2016 # The prelude is evaluated by the child shell.
+CLAUDE_PLUGIN_SWAP_REGISTRY='
+eval "_ai_state_orig_guard() $(declare -f _dev_process_delete_guard_allows | tail -n +2)"
+_dev_process_delete_guard_allows() {
+    if [[ -n "${1:-}" ]]; then
+        cp "$HOME/.claude/plugins/installed_plugins.next" "$HOME/.claude/plugins/installed_plugins.json"
+    fi
+    _ai_state_orig_guard "$@"
+}'
+
+@test "claude orphan plugin version keeps when it is registered again before the sink" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local plugins="$case_home/.claude/plugins"
+    local cache="$plugins/cache/m/p"
+    printf '{"version":2,"plugins":{"p@m":[{"scope":"user","installPath":"%s","version":"old"}]}}\n' \
+        "$cache/old" > "$plugins/installed_plugins.next"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans "$CLAUDE_PLUGIN_SWAP_REGISTRY"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"stopped (process or cache path state unknown)"* ]] || { echo "$output"; return 1; }
+}
+
+@test "claude orphan plugin version keeps when the registry turns unreadable before the sink" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    local plugins="$case_home/.claude/plugins"
+    local cache="$plugins/cache/m/p"
+    printf 'not a registry\n' > "$plugins/installed_plugins.next"
+
+    ai_state_run "$case_home" clean_claude_plugin_orphans "$CLAUDE_PLUGIN_SWAP_REGISTRY"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"stopped (process or cache path state unknown)"* ]] || { echo "$output"; return 1; }
+}
+
+# A 30-day-old atomic-write temp from pid 999999 next to a fresher live config.
+claude_config_temp_fixture() {
+    local case_home="$1"
+    local name="${2:-.claude.json.tmp.999999.abc123}"
+    printf '{"old":true}\n' > "$case_home/$name"
+    printf '{"backup":true}\n' > "$case_home/.claude.json.backup"
+    ai_state_age_tree "$case_home/$name"
+    ai_state_age_tree "$case_home/.claude.json.backup"
+    printf '{"live":true}\n' > "$case_home/.claude.json"
+}
+
+@test "claude config temp from a dead writer is removed" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_config_temp_fixture "$case_home"
+
+    ai_state_run "$case_home" clean_claude_config_temps
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$case_home/.claude.json.tmp.999999.abc123" ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.claude.json" ] || return 1
+    [ -f "$case_home/.claude.json.backup" ]
+}
+
+@test "claude config temp keeps a config temp whose pid is alive" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_config_temp_fixture "$case_home"
+    printf '999999\n' > "$case_home/ps-alive"
+
+    ai_state_run "$case_home" clean_claude_config_temps
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.claude.json.tmp.999999.abc123" ] || { echo "$output"; return 1; }
+}
+
+@test "claude config temp keeps when ps errors" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_config_temp_fixture "$case_home"
+    : > "$case_home/ps-error"
+
+    ai_state_run "$case_home" clean_claude_config_temps
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.claude.json.tmp.999999.abc123" ] || { echo "$output"; return 1; }
+}
+
+@test "claude config temp ignores .claude.json.tmp.x.y with a non-numeric pid" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_config_temp_fixture "$case_home" ".claude.json.tmp.x.y"
+
+    ai_state_run "$case_home" clean_claude_config_temps
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.claude.json.tmp.x.y" ] || { echo "$output"; return 1; }
+}
+
+@test "claude config temp keeps a fresh temp" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_config_temp_fixture "$case_home"
+    touch -t "$(date -v-1d +%Y%m%d%H%M)" "$case_home/.claude.json.tmp.999999.abc123"
+
+    ai_state_run "$case_home" clean_claude_config_temps
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.claude.json.tmp.999999.abc123" ] || { echo "$output"; return 1; }
+}
+
+@test "claude config temp keeps the temp when the live config is missing or older" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_config_temp_fixture "$case_home"
+    rm -f "$case_home/.claude.json"
+
+    ai_state_run "$case_home" clean_claude_config_temps
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.claude.json.tmp.999999.abc123" ] || { echo "$output"; return 1; }
+
+    printf '{"live":true}\n' > "$case_home/.claude.json"
+    touch -t "$(date -v-40d +%Y%m%d%H%M)" "$case_home/.claude.json"
+
+    ai_state_run "$case_home" clean_claude_config_temps
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.claude.json.tmp.999999.abc123" ] || { echo "$output"; return 1; }
+}
+
+# Empty, 30-day-old Codex temp skeletons plus a non-empty clone dir.
+codex_skeleton_fixture() {
+    local case_home="$1"
+    mkdir -p "$case_home/.codex/.tmp/git-AbC123" "$case_home/.codex/.tmp/git-busy01" \
+        "$case_home/.codex/.tmp/git-ABCDEFG" "$case_home/.codex/tmp/arg0/codex-arg0Xy9Z01" \
+        "$case_home/.codex/tmp/path/keep"
+    printf 'ref\n' > "$case_home/.codex/.tmp/git-busy01/HEAD"
+    ai_state_age_tree "$case_home/.codex"
+}
+
+@test "codex empty git skeleton older than 7d is removed" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    codex_skeleton_fixture "$case_home"
+
+    ai_state_run "$case_home" clean_codex_temp_skeletons
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$case_home/.codex/.tmp/git-AbC123" ] || { echo "$output"; return 1; }
+    [ ! -e "$case_home/.codex/tmp/arg0/codex-arg0Xy9Z01" ] || { echo "$output"; return 1; }
+    [ -d "$case_home/.codex/tmp/path/keep" ] || return 1
+    [ -d "$case_home/.codex/tmp/arg0" ]
+}
+
+@test "codex empty git skeleton keeps a non-empty git-* dir" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    codex_skeleton_fixture "$case_home"
+
+    ai_state_run "$case_home" clean_codex_temp_skeletons
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.codex/.tmp/git-busy01/HEAD" ] || { echo "$output"; return 1; }
+}
+
+@test "codex empty git skeleton keeps everything while codex runs" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    codex_skeleton_fixture "$case_home"
+
+    ai_state_run "$case_home" clean_codex_temp_skeletons \
+        'pgrep() { [[ "$*" == *codex* ]] && return 0; return 1; }'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -d "$case_home/.codex/.tmp/git-AbC123" ] || { echo "$output"; return 1; }
+    [ -d "$case_home/.codex/tmp/arg0/codex-arg0Xy9Z01" ] || return 1
+    [[ "$output" == *"DEFER=Codex"* ]]
+}
+
+@test "codex empty git skeleton stops when the process state is unknown" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    codex_skeleton_fixture "$case_home"
+
+    ai_state_run "$case_home" clean_codex_temp_skeletons 'pgrep() { return 3; }'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -d "$case_home/.codex/.tmp/git-AbC123" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Codex temp dirs · stopped (process state unknown)"* ]]
+}
+
+@test "codex empty git skeleton keeps a dir that gains an entry before the sink" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    codex_skeleton_fixture "$case_home"
+
+    # shellcheck disable=SC2016 # The prelude is evaluated by the child shell.
+    ai_state_run "$case_home" clean_codex_temp_skeletons '
+eval "_ai_state_orig_guard() $(declare -f _dev_process_delete_guard_allows | tail -n +2)"
+_dev_process_delete_guard_allows() {
+    if [[ -n "${1:-}" ]]; then
+        printf "ref\n" > "$1/HEAD"
+        touch -t "$(date -v-30d +%Y%m%d%H%M)" "$1"
+    fi
+    _ai_state_orig_guard "$@"
+}'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/.codex/.tmp/git-AbC123/HEAD" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Codex temp dirs · stopped (process state unknown)"* ]]
+}
+
+# The shape Codex actually leaks: `git init` left HEAD and empty objects/
+# and refs/, and nothing was ever fetched.
+codex_git_stub() {
+    mkdir -p "$1/objects" "$1/refs"
+    printf 'ref: refs/heads/main\n' > "$1/HEAD"
+}
+
+@test "codex git init stub older than 7d is removed" {
+    local case_home tmp
+    case_home=$(ai_state_case_home)
+    tmp="$case_home/.codex/.tmp"
+    codex_git_stub "$tmp/git-StUb01"
+    ai_state_age_tree "$case_home/.codex"
+
+    ai_state_run "$case_home" clean_codex_temp_skeletons
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$tmp/git-StUb01" ] || { echo "$output"; return 1; }
+    [ -d "$tmp" ]
+}
+
+@test "codex git init stub keeps fetched objects, extra entries and fresh stubs" {
+    local case_home tmp
+    case_home=$(ai_state_case_home)
+    tmp="$case_home/.codex/.tmp"
+    codex_git_stub "$tmp/git-Fetch1"
+    mkdir -p "$tmp/git-Fetch1/objects/pack"
+    printf 'pack\n' > "$tmp/git-Fetch1/objects/pack/pack-1.pack"
+    codex_git_stub "$tmp/git-Extra1"
+    printf '[core]\n' > "$tmp/git-Extra1/config"
+    codex_git_stub "$tmp/git-Fresh1"
+    ai_state_age_tree "$case_home/.codex"
+    printf 'ref: refs/heads/main\n' > "$tmp/git-Fresh1/HEAD"
+
+    ai_state_run "$case_home" clean_codex_temp_skeletons
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$tmp/git-Fetch1/objects/pack/pack-1.pack" ] || { echo "$output"; return 1; }
+    [ -f "$tmp/git-Extra1/config" ] || return 1
+    [ -f "$tmp/git-Fresh1/HEAD" ]
+}
+
+@test "codex empty git skeleton ignores git-ABCDEFG (7 chars)" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    codex_skeleton_fixture "$case_home"
+
+    ai_state_run "$case_home" clean_codex_temp_skeletons
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -d "$case_home/.codex/.tmp/git-ABCDEFG" ] || { echo "$output"; return 1; }
+}
+
+@test "ai cli disposable state dry-run lists only eligible paths and writes nothing" {
+    local case_home
+    case_home=$(ai_state_case_home)
+    claude_plugin_fixture "$case_home"
+    claude_config_temp_fixture "$case_home"
+    codex_skeleton_fixture "$case_home"
+    local cache="$case_home/.claude/plugins/cache/m/p"
+
+    # shellcheck disable=SC2016 # The prelude is evaluated by the child shell.
+    ai_state_run "$case_home" ai_state_dry_run_all '
+DRY_RUN=true
+ai_state_dry_run_all() {
+    clean_claude_code_disposable_state
+    clean_codex_temp_skeletons
+    printf "LEDGER=%s\n" "$(tr "\0" "\n" < "$CLEAN_PREVIEW_LEDGER_FILE" 2> /dev/null || true)"
+}
+CLEAN_PREVIEW_LEDGER_FILE="$HOME/ledger"
+: > "$CLEAN_PREVIEW_LEDGER_FILE"'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/server.js" ] || { echo "$output"; return 1; }
+    [ -f "$cache/old/.orphaned_at" ] || return 1
+    [ -f "$case_home/.claude.json.tmp.999999.abc123" ] || return 1
+    [ -d "$case_home/.codex/.tmp/git-AbC123" ] || return 1
+    [ -d "$case_home/.codex/tmp/arg0/codex-arg0Xy9Z01" ] || return 1
+    [[ "$output" == *"$cache/old"* ]] || return 1
+    [[ "$output" == *"$case_home/.claude.json.tmp.999999.abc123"* ]] || return 1
+    [[ "$output" == *"$case_home/.codex/.tmp/git-AbC123"* ]] || return 1
+    [[ "$output" != *"$cache/new"* ]] || return 1
+    [[ "$output" != *"git-busy01"* ]] || return 1
+    [[ "$output" != *"git-ABCDEFG"* ]] || return 1
+    [[ "$output" != *"$case_home/.claude.json.backup"* ]]
+}
+
+# ----------------------------------------------------------------------------
+# Automation browser profiles and dot-directory caches (clean_fork_app_caches)
+# ----------------------------------------------------------------------------
+
+# Chromium user-data-dir with cache leaves and login state.
+automation_profile_fixture() {
+    local root="$1"
+    mkdir -p "$root/Default/GPUCache" "$root/Default/Local Storage" "$root/extensions_crx_cache"
+    printf 'g\n' > "$root/Default/GPUCache/g"
+    printf 'l\n' > "$root/Default/Local Storage/l"
+    printf 'cookies\n' > "$root/Default/Cookies"
+    printf 'x\n' > "$root/extensions_crx_cache/x"
+    printf '{}\n' > "$root/Local State"
+}
+
+@test "x-browser-profile caches kept while a browser uses --user-data-dir" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    root="$case_home/.local/share/x-browser-profile"
+    automation_profile_fixture "$root"
+    printf 'Chrome --user-data-dir=%s --remote-debugging-port=9222\n' "$root" > "$case_home/ps-busy"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$root/Default/GPUCache/g" ] || { echo "$output"; return 1; }
+    [ -f "$root/extensions_crx_cache/x" ] || return 1
+    [[ "$output" == *"DEFER=x-browser-profile"* ]] || return 1
+
+    rm -f "$case_home/ps-busy"
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$root/Default/GPUCache/g" ] || { echo "$output"; return 1; }
+    [ ! -e "$root/extensions_crx_cache/x" ] || return 1
+    [ -f "$root/Default/Cookies" ] || return 1
+    [ -f "$root/Default/Local Storage/l" ] || return 1
+    [ -f "$root/Local State" ]
+}
+
+@test "x-browser-profile caches kept when the process table is unreadable" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    root="$case_home/.local/share/x-browser-profile"
+    automation_profile_fixture "$root"
+    touch "$case_home/ps-error"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$root/Default/GPUCache/g" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"x-browser-profile caches · stopped (process state unknown)"* ]]
+}
+
+@test "gemini-web-pool account profile-acct2 is cleaned while profile-acct20 is in use" {
+    local case_home accounts
+    case_home=$(fork_caches_case_home)
+    accounts="$case_home/.gemini-web-pool/accounts"
+    automation_profile_fixture "$accounts/profile-acct2"
+    automation_profile_fixture "$accounts/profile-acct20"
+    printf '{"cookie":"secret"}\n' > "$accounts/acct2.json"
+    printf 'Chrome --user-data-dir=%s\n' "$accounts/profile-acct20" > "$case_home/ps-busy"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$accounts/profile-acct2/Default/GPUCache/g" ] || { echo "$output"; return 1; }
+    [ -f "$accounts/profile-acct2/Default/Cookies" ] || return 1
+    [ -f "$accounts/profile-acct20/Default/GPUCache/g" ] || return 1
+    [ -f "$accounts/acct2.json" ] || return 1
+    [[ "$output" == *"DEFER=gemini-web-pool profile-acct20"* ]]
+}
+
+@test "gemini-web-pool skips a symlinked account profile" {
+    local case_home accounts
+    case_home=$(fork_caches_case_home)
+    accounts="$case_home/.gemini-web-pool/accounts"
+    automation_profile_fixture "$case_home/outside-profile"
+    mkdir -p "$accounts"
+    ln -s "$case_home/outside-profile" "$accounts/profile-acct3"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/outside-profile/Default/GPUCache/g" ] || { echo "$output"; return 1; }
+    [ -f "$case_home/outside-profile/extensions_crx_cache/x" ]
+}
+
+@test "nvm cache keeps files younger than 7d" {
+    local case_home cache
+    case_home=$(fork_caches_case_home)
+    cache="$case_home/.nvm/.cache/bin/node-v20.0.0-darwin-arm64"
+    mkdir -p "$cache" "$case_home/.nvm/versions/node/v20.0.0/bin"
+    printf 'old\n' > "$cache/old.tar.xz"
+    printf 'node\n' > "$case_home/.nvm/versions/node/v20.0.0/bin/node"
+    printf '# nvm\n' > "$case_home/.nvm/nvm.sh"
+    fork_caches_age_tree "$case_home/.nvm"
+    printf 'new\n' > "$cache/new.tar.xz"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$cache/old.tar.xz" ] || { echo "$output"; return 1; }
+    [ -f "$cache/new.tar.xz" ] || return 1
+    [ -f "$case_home/.nvm/versions/node/v20.0.0/bin/node" ]
+}
+
+@test "nvm cache ignores an NVM_DIR outside HOME" {
+    local case_home outside
+    case_home=$(fork_caches_case_home)
+    outside="$BATS_TEST_TMPDIR/nvm-outside"
+    mkdir -p "$outside/.cache/bin"
+    printf 'old\n' > "$outside/.cache/bin/old.tar.xz"
+    fork_caches_age_tree "$outside"
+
+    fork_caches_run "$case_home" clean_fork_app_caches "NVM_DIR='$outside'"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$outside/.cache/bin/old.tar.xz" ] || { echo "$output"; return 1; }
+}
+
+@test "nvm cache ignores an NVM_DIR that is not an nvm install" {
+    local case_home docs
+    case_home=$(fork_caches_case_home)
+    docs="$case_home/Documents"
+    mkdir -p "$docs/.cache/bin"
+    printf 'old\n' > "$docs/.cache/bin/old.tar.xz"
+    fork_caches_age_tree "$docs"
+
+    fork_caches_run "$case_home" clean_fork_app_caches "NVM_DIR='$docs'"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$docs/.cache/bin/old.tar.xz" ] || { echo "$output"; return 1; }
+}
+
+@test "uv python .temp never touches interpreter dirs" {
+    local case_home python_root
+    case_home=$(fork_caches_case_home)
+    python_root="$case_home/.local/share/uv/python"
+    mkdir -p "$python_root/.temp/partial" "$python_root/cpython-3.12.0-macos-aarch64-none/bin"
+    printf 'part\n' > "$python_root/.temp/partial/download.tar.gz"
+    printf 'py\n' > "$python_root/cpython-3.12.0-macos-aarch64-none/bin/python3"
+    fork_caches_age_tree "$python_root"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$python_root/.temp/partial/download.tar.gz" ] || { echo "$output"; return 1; }
+    [ -f "$python_root/cpython-3.12.0-macos-aarch64-none/bin/python3" ]
+}
+
+@test "uv python .temp is kept while uv runs" {
+    local case_home python_root
+    case_home=$(fork_caches_case_home)
+    python_root="$case_home/.local/share/uv/python"
+    mkdir -p "$python_root/.temp/partial"
+    printf 'part\n' > "$python_root/.temp/partial/download.tar.gz"
+    fork_caches_age_tree "$python_root"
+    printf '%s\n' "/opt/homebrew/bin/uv python install 3.13" > "$case_home/ps-busy"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$python_root/.temp/partial/download.tar.gz" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER=uv"* ]]
+}
+
+@test "electron-gyp headers row is present in the frontend caches" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { printf 'SAFE:%s|%s\n' "$1" "${*: -1}"; }
+clean_dev_frontend
+EOF
+    assert_run_success
+    assert_output_contains "SAFE:$HOME/.electron-gyp/*|electron-gyp headers cache"
+}
+
+@test "clean_dev_misc registers the fork app caches step" {
+    mole_test_fake_command mdfind
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { :; }
+safe_find_delete() { :; }
+clean_service_worker_cache() { :; }
+note_activity() { :; }
+pgrep() { return 1; }
+clean_fork_app_caches() { echo "FORK_CALLED"; }
+clean_dev_misc
+EOF
+    assert_run_success
+    assert_output_contains "FORK_CALLED"
 }

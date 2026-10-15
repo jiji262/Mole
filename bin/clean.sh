@@ -25,6 +25,7 @@ source "$SCRIPT_DIR/../lib/clean/apps.sh"
 source "$SCRIPT_DIR/../lib/clean/dev.sh"
 source "$SCRIPT_DIR/../lib/clean/app_caches.sh"
 source "$SCRIPT_DIR/../lib/clean/hints.sh"
+source "$SCRIPT_DIR/../lib/clean/review_hints_home.sh"
 source "$SCRIPT_DIR/../lib/clean/system.sh"
 source "$SCRIPT_DIR/../lib/clean/user.sh"
 
@@ -1833,11 +1834,17 @@ perform_cleanup() {
             # ===== 14. Large files =====
             start_section "Large files"
             _run_cleanup_step check_large_file_candidates || return $?
+            _run_cleanup_step show_data_review_hints || return $?
             end_section
 
             # ===== 15. Project artifacts =====
             start_section "Project artifacts"
             _run_cleanup_step show_project_artifact_hint_notice || return $?
+            end_section
+
+            # ===== 16. Review (report-only hints, never deletes) =====
+            start_section "Review"
+            _run_cleanup_step show_home_review_hints || return $?
             end_section
         fi
     }

@@ -2,6 +2,12 @@
 # Developer Tools Cleanup Module
 set -euo pipefail
 
+_mole_dev_module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Claude Code and Codex disposable state, called from clean_dev_misc.
+source "$_mole_dev_module_dir/ai_cli_state.sh"
+# Chromium-fork, automation-profile and dot-dir cache leaves, from clean_dev_misc.
+source "$_mole_dev_module_dir/fork_app_caches.sh"
+
 # Tool cache helper (respects DRY_RUN and whitelist).
 # Args:
 #   $1 = description (display name)
@@ -493,6 +499,106 @@ clean_pnpm_stores() {
     fi
 }
 
+# npx keeps one directory per package set under <cache>/_npx/<16 hex>, and MCP
+# servers run straight out of it for as long as the client keeps them up. A
+# wholesale `_npx/*` row deleted the code under a live server, so every entry
+# is judged on its own. Unknown process or age state keeps the entry.
+_npm_npx_entry_name_ok() {
+    local name="$1"
+    [[ ${#name} -eq 16 && "$name" =~ ^[0-9a-f]+$ ]]
+}
+
+# 0 = keep (modified within MOLE_TEMP_FILE_AGE_DAYS, or the probe could not
+# tell), 1 = old. A signal propagates as its own status.
+_npm_npx_entry_recent_state() {
+    local entry="$1"
+    local recent="" rc=0
+    recent=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        find -P "$entry" -maxdepth 1 -mtime -"$MOLE_TEMP_FILE_AGE_DAYS" -print -quit 2> /dev/null) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        if mole_rc_timeout_or_signal "$rc" && ! mole_rc_timeout "$rc"; then
+            return "$rc"
+        fi
+        return 0
+    fi
+    [[ -n "$recent" ]] && return 0
+    return 1
+}
+
+# Process probe for clean_guarded_dev_cache_root. At the deletion boundary it
+# judges only the leaf being removed; before that, only the entries that are
+# still eligible, so a server running from one entry never blocks its idle
+# siblings.
+npm_npx_entry_process_state() {
+    if [[ -n "${_MOLE_DEV_GUARDED_PATH:-}" ]]; then
+        mole_process_args_reference_paths --fresh "$_MOLE_DEV_GUARDED_PATH"
+        return $?
+    fi
+    [[ -n "${_MOLE_NPX_IDLE_ENTRIES[*]:-}" ]] || return 1
+    mole_process_args_reference_paths --fresh "${_MOLE_NPX_IDLE_ENTRIES[@]}"
+}
+
+_npm_npx_report_state_probe() {
+    return "$_MOLE_NPX_REPORT_STATE"
+}
+
+# Report entries held back by a running (0) or unknown (2) process state once
+# per cache root, through the shared tri-state translator.
+_npm_npx_report_held_entries() {
+    local _MOLE_NPX_REPORT_STATE="$1"
+    local display_name="$2"
+    local _MOLE_CLEAN_GUARD_REASON=""
+    mole_clean_process_guard _npm_npx_report_state_probe "npx started" && return 0
+    mole_report_guard_stop "$display_name" mole_defer_cleanup_family "npx"
+}
+
+# Usage: clean_npm_npx_cache <npm_cache_root> <display_name>
+clean_npm_npx_cache() {
+    local cache_root="${1%/}"
+    local display_name="$2"
+    local npx_root="$cache_root/_npx"
+    [[ -d "$npx_root" ]] || return 0
+    if [[ -L "$cache_root" || -L "$npx_root" ]]; then
+        debug_log "Skipping symlinked npm npx cache root: $npx_root"
+        return 0
+    fi
+
+    local table=""
+    _mole_read_process_table && table="$_MOLE_PROCESS_TABLE_READ"
+    local -a _MOLE_NPX_IDLE_ENTRIES=() in_use=() unknown=()
+    local entry state
+    for entry in "$npx_root"/*; do
+        [[ -d "$entry" && ! -L "$entry" ]] || continue
+        _npm_npx_entry_name_ok "${entry##*/}" || continue
+        state=0
+        _npm_npx_entry_recent_state "$entry" || state=$?
+        case "$state" in
+            0) continue ;;
+            1) ;;
+            *) return "$state" ;;
+        esac
+        state=0
+        mole_process_table_references_paths "$table" "$entry" || state=$?
+        case "$state" in
+            1) _MOLE_NPX_IDLE_ENTRIES+=("$entry") ;;
+            0) in_use+=("$entry") ;;
+            *) unknown+=("$entry") ;;
+        esac
+    done
+
+    if [[ ${#unknown[@]} -gt 0 ]] && mole_cleanup_targets_exist "${unknown[@]}"; then
+        _npm_npx_report_held_entries 2 "$display_name"
+    fi
+    if [[ ${#in_use[@]} -gt 0 ]] && mole_cleanup_targets_exist "${in_use[@]}"; then
+        _npm_npx_report_held_entries 0 "$display_name"
+    fi
+    [[ ${#_MOLE_NPX_IDLE_ENTRIES[@]} -gt 0 ]] || return 0
+
+    clean_guarded_dev_cache_root "$cache_root" "$npx_root" \
+        npm_npx_entry_process_state "npx" "$display_name" \
+        "${_MOLE_NPX_IDLE_ENTRIES[@]}"
+}
+
 # npm/pnpm/yarn/bun caches.
 clean_dev_npm() {
     local npm_default_cache="$HOME/.npm"
@@ -514,15 +620,18 @@ clean_dev_npm() {
         fi
     fi
 
-    # These residual directories are not removed by `npm cache clean --force`
-    local -a npm_residual_dirs=("_cacache" "_npx" "_logs" "_prebuilds")
-    local -a npm_descriptions=("npm cache directory" "npm npx cache" "npm logs" "npm prebuilds")
+    # These residual directories are not removed by `npm cache clean --force`.
+    # _npx is not one of them: MCP servers run out of it, so it is cleaned per
+    # entry by clean_npm_npx_cache.
+    local -a npm_residual_dirs=("_cacache" "_logs" "_prebuilds")
+    local -a npm_descriptions=("npm cache directory" "npm logs" "npm prebuilds")
 
     # Clean default npm cache path
     local i
     for i in "${!npm_residual_dirs[@]}"; do
         safe_clean "$npm_default_cache/${npm_residual_dirs[$i]}"/* "${npm_descriptions[$i]}"
     done
+    clean_npm_npx_cache "$npm_default_cache" "npm npx cache" || return $?
 
     # Normalize paths for comparison (remove trailing slash + resolve symlinked dirs)
     local npm_cache_path_normalized="${npm_cache_path%/}"
@@ -539,6 +648,7 @@ clean_dev_npm() {
         for i in "${!npm_residual_dirs[@]}"; do
             safe_clean "$npm_cache_path/${npm_residual_dirs[$i]}"/* "${npm_descriptions[$i]} (custom path)"
         done
+        clean_npm_npx_cache "${npm_cache_path%/}" "npm npx cache (custom path)" || return $?
     fi
 
     clean_pnpm_stores || return $?
@@ -1376,7 +1486,7 @@ find_orbstack_data_dir() {
 clean_dev_docker() {
     if command -v docker > /dev/null 2>&1; then
         note_activity
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Docker unused data · review with docker system df"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Docker unused data · review with docker system df · docker image prune -a · docker builder prune"
         debug_log "Docker daemon-managed cleanup skipped by default"
     fi
 
@@ -1426,6 +1536,7 @@ clean_dev_frontend() {
     safe_clean ~/.cache/electron/* "Electron cache"
     safe_clean ~/.cache/node-gyp/* "node-gyp cache"
     safe_clean ~/.node-gyp/* "node-gyp build cache"
+    safe_clean ~/.electron-gyp/* "electron-gyp headers cache"
     safe_clean ~/.turbo/cache/* "Turbo cache"
     safe_clean ~/.vite/cache/* "Vite cache"
     safe_clean ~/.cache/vite/* "Vite global cache"
@@ -5349,6 +5460,90 @@ _codex_marketplace_staging_safe_clean_guarded() {
     return "$guarded_rc"
 }
 
+# Codex temp skeletons: ~/.codex/.tmp/git-XXXXXX clone dirs and
+# ~/.codex/tmp/arg0/codex-arg0XXXXXX launcher dirs that Codex left empty, or
+# (git-* only) as a bare `git init` stub nothing was ever fetched into; inode
+# tidy-up only, with that shape as the owner evidence (see ai_cli_state.sh).
+# Any other git-* content may be an in-flight clone. Marketplace staging
+# (cleaned below), tmp/path, and worktrees are not candidates.
+
+# find -size bound for a stub's HEAD: under 65 bytes ("ref: refs/heads/<b>").
+_CODEX_GIT_STUB_HEAD_SIZE_LIMIT=65
+
+# 0 = exactly HEAD (a small regular file) plus empty objects/ and refs/
+# directories, each aged; 1 = anything else. A signal propagates.
+_codex_git_stub_only() {
+    local dir="$1" entry count=0 age="+$MOLE_TEMP_FILE_AGE_DAYS"
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        [[ ! -L "$entry" ]] || return 1
+        count=$((count + 1))
+        case "${entry##*/}" in
+            HEAD) _ai_cli_find_matches "$entry" -maxdepth 0 -type f \
+                -size -"$_CODEX_GIT_STUB_HEAD_SIZE_LIMIT"c -mtime "$age" || return $? ;;
+            objects | refs) _ai_cli_find_matches "$entry" -maxdepth 0 -type d \
+                -empty -mtime "$age" || return $? ;;
+            *) return 1 ;;
+        esac
+    done
+    [[ $count -eq 3 ]]
+}
+
+# 0 = an empty (or git-init stub), aged skeleton directly under its fixed root.
+_codex_skeleton_is_stale() {
+    local dir="$1" root="${1%/*}" name="${1##*/}"
+    case "$root" in
+        "$HOME/.codex/.tmp") [[ "$name" =~ ^git-[A-Za-z0-9]{6}$ ]] || return 1 ;;
+        "$HOME/.codex/tmp/arg0") [[ "$name" =~ ^codex-arg0[A-Za-z0-9]{6}$ ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    codex_staging_physical_path "$dir" "$root" > /dev/null || return 1
+    local rc=0
+    _ai_cli_find_matches "$dir" -maxdepth 0 -type d -empty -mtime +"$MOLE_TEMP_FILE_AGE_DAYS" || rc=$?
+    [[ $rc -eq 1 && "$name" == git-* ]] || return "$rc"
+    _codex_git_stub_only "$dir" || return $?
+    _ai_cli_find_matches "$dir" -maxdepth 0 -type d -mtime +"$MOLE_TEMP_FILE_AGE_DAYS"
+}
+
+# Process probe for _dev_safe_clean_process_guarded. At the deletion boundary
+# the leaf must still be an empty, unlinked skeleton; its identity is bound.
+codex_skeleton_process_state() {
+    local path="${_MOLE_DEV_GUARDED_PATH:-}"
+    if [[ -n "$path" ]]; then
+        _codex_skeleton_is_stale "$path" || return 2
+        _ai_cli_bind_sink "$path" || return 2
+    fi
+    codex_runtime_process_state
+}
+
+clean_codex_temp_skeletons() {
+    local codex_root="$HOME/.codex" dir state rc=0
+    [[ -d "$codex_root" && ! -L "$codex_root" ]] || return 0
+    local -a candidates=()
+    for dir in "$codex_root"/.tmp/git-* "$codex_root"/tmp/arg0/codex-arg0*; do
+        state=0
+        _codex_skeleton_is_stale "$dir" || state=$?
+        [[ $state -le 1 ]] || return "$state"
+        [[ $state -eq 0 ]] && candidates+=("$dir")
+    done
+    [[ ${#candidates[@]} -gt 0 ]] || return 0
+    if is_path_whitelisted "$codex_root" || is_path_whitelisted "$codex_root/.tmp"; then
+        debug_log "Codex temp dirs kept: whitelist"
+        return 0
+    fi
+
+    local _MOLE_CLEAN_GUARD_REASON=""
+    if ! mole_clean_process_guard codex_runtime_process_state "Codex started"; then
+        mole_report_guard_stop "Codex temp dirs" mole_defer_cleanup_family "Codex"
+        return 0
+    fi
+    _dev_safe_clean_process_guarded codex_skeleton_process_state "Codex" \
+        "Codex temp dirs" "${candidates[@]}" "Codex temp dirs" || rc=$?
+    mole_rc_timeout_or_signal "$rc" && return "$rc"
+    return 0
+}
+
 # Abandoned Codex marketplace staging leftovers (#1389). Completes marketplaces
 # such as openai-bundled and configured marketplace dirs are never candidates;
 # only exact staging prefixes under fixed roots, aged by MOLE_ORPHAN_AGE_DAYS.
@@ -5866,6 +6061,8 @@ clean_dev_misc() {
     clean_codex_crashpad_pending
     # Abandoned marketplace staging under ~/.codex/.tmp (completed marketplaces stay).
     clean_codex_marketplace_staging
+    # Empty or git-init-stub, aged ~/.codex/.tmp/git-* and tmp/arg0 skeletons only.
+    clean_codex_temp_skeletons
     # Codex CLI working-directory caches (~/.codex)
     clean_codex_cli
     # Cursor Agent session logs (versions cleaned separately in clean_dev_ai_agents)
@@ -5876,11 +6073,16 @@ clean_dev_misc() {
     # with the revision. Keep this surface read-only.
     # Chrome DevTools MCP keeps a Chromium profile; clean only rebuildable caches.
     clean_chrome_devtools_mcp_caches
-    # Claude Code state under ~/.claude can include persistent memory,
-    # plugin registry data, hooks, and session context. Do not clean it
-    # automatically; users can remove specific paths manually if needed.
+    # Claude Code: only plugin versions carrying Claude Code's own aged
+    # .orphaned_at marker and config temps from a dead writer. Projects,
+    # memory, sessions, settings, hooks, plugin registries, marketplaces, and
+    # plugin data under ~/.claude stay untouched.
+    clean_claude_code_disposable_state
     # Wondershare orphan installer payload (bundle ID differs from live app)
     safe_clean ~/Library/Application\ Support/com.wondershare.Installer/* "Wondershare installer payload"
+    # Named cache leaves of Chromium forks and automation profiles, nvm and
+    # uv download temp; profiles, cookies and account files stay.
+    clean_fork_app_caches
 }
 # Shell and VCS leftovers.
 clean_dev_shell() {

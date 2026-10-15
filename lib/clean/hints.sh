@@ -43,6 +43,9 @@ hint_get_path_size_kb_with_timeout() {
 
     if [[ $du_status -ne 0 ]]; then
         rm -f "$du_tmp"
+        # A signal keeps its status so a review-row caller can stop clean;
+        # every other failure is a plain "unknown size".
+        [[ $du_status -ge 128 ]] && return "$du_status"
         return 1
     fi
 

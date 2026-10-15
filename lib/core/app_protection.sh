@@ -390,6 +390,21 @@ _is_wechat_web_profile_cache_child() {
     return 1
 }
 
+# QQ (NT) container paths cleaned by clean_qq_container_caches. com.tencent.qq
+# stays data-protected; only these exact shapes pass, like WeChat's logs: the
+# log trees, an account's nt_data/log, and a top-level versions/*.zip, which
+# the cleaner further restricts to the archive of the running version.
+_mole_is_qq_container_cache_path() {
+    local q="$HOME/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"
+    [[ "$1" == "$q"/* ]] || return 1
+    local relative="${1#"$q"/}"
+    case "$relative" in
+        log/?* | global/nt_data/Log/log/?*) return 0 ;;
+    esac
+    [[ "$relative" =~ ^nt_qq_[0-9a-f]{32}/nt_data/log/. ]] && return 0
+    [[ "$relative" =~ ^versions/[^/]+[.]zip$ ]]
+}
+
 # Check if a path is protected from deletion
 # Centralized logic to protect system settings, control center, and critical apps
 #
@@ -496,7 +511,8 @@ should_protect_path() {
         if [[ "$path" == */Data/Library/Caches/* || "$path" == */Data/tmp/* ||
             "$path" == "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/log/"* ||
             "$path" == "$HOME/Library/Containers/com.tencent.xinWeChat/Data/.wxapplet/WMPF/"* ]] ||
-            _is_wechat_web_profile_cache_child "$path"; then
+            _is_wechat_web_profile_cache_child "$path" ||
+            _mole_is_qq_container_cache_path "$path"; then
             _container_cache_path=true
         elif [[ "${MOLE_UNINSTALL_MODE:-0}" != "1" ]] && should_protect_data "$bundle_id"; then
             return 0

@@ -583,3 +583,107 @@ require_fd() {
         [[ "$output" != *"Files to be removed"* ]] || return 1
     done
 }
+
+# fd is optional on CI and on developer Macs. Without it, stand in a fake fd
+# that walks like `fd --type f --max-depth N` and matches the regex against the
+# file name with grep -E, so the producer pattern itself is still exercised.
+# It rejects -e/--extension: a pattern-plus-extension call ANDs the two.
+installer_use_fd_backend() {
+    require_fd && return 0
+    local fake_dir="$BATS_TEST_TMPDIR/fake-bin"
+    mkdir -p "$fake_dir"
+    cat > "$fake_dir/fd" << 'FAKE_FD'
+#!/bin/bash
+depth=1 pattern="" root="" have_pattern=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --max-depth | --type) [[ "$1" != --max-depth ]] || depth="$2"; shift 2 ;;
+        -e | --extension) echo "fake fd: unexpected $1" >&2; exit 2 ;;
+        -*) shift ;;
+        *)
+            if [[ $have_pattern -eq 0 ]]; then pattern="$1"; have_pattern=1; else root="$1"; fi
+            shift
+            ;;
+    esac
+done
+/usr/bin/find "$root" -mindepth 1 -maxdepth "$depth" -type f -print0 |
+    while IFS= read -r -d '' f; do
+        printf '%s\n' "${f##*/}" | /usr/bin/grep -Eq -- "$pattern" && printf '%s\0' "$f"
+    done
+exit 0
+FAKE_FD
+    chmod +x "$fake_dir/fd"
+    export PATH="$fake_dir:$PATH"
+}
+
+installer_fd_days_ago_stamp() {
+    date -v-"$1"d +%Y%m%d%H%M
+}
+
+installer_fd_reset_downloads() {
+    rm -rf "${HOME:?}/Downloads"
+    mkdir -p "$HOME/Downloads"
+}
+
+installer_fd_scan() {
+    run /bin/bash -euo pipefail -c '
+        export MOLE_TEST_MODE=1
+        source "$1"
+        command -v fd > /dev/null || exit 9
+        scan_installers_in_path "$2" | tr "\0" "\n"
+    ' bash "$PROJECT_ROOT/bin/installer.sh" "$1"
+}
+
+@test "installer (fd) scans ~/Library/Parallels/Downloads for iso" {
+    installer_use_fd_backend
+    mkdir -p "$HOME/Library/Parallels/Downloads"
+    printf 'iso' > "$HOME/Library/Parallels/Downloads/Win.iso"
+
+    run /bin/bash -euo pipefail -c '
+        export MOLE_TEST_MODE=1
+        source "$1"
+        scan_all_installers | tr "\0" "\n"
+    ' bash "$PROJECT_ROOT/bin/installer.sh"
+
+    rm -rf "$HOME/Library/Parallels"
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"/Library/Parallels/Downloads/Win.iso"* ]]
+}
+
+@test "installer (fd) lists .exe and .msi installers" {
+    installer_use_fd_backend
+    installer_fd_reset_downloads
+    : > "$HOME/Downloads/Setup.exe"
+    : > "$HOME/Downloads/Tool.msi"
+    : > "$HOME/Downloads/backup.tar.gz"
+    : > "$HOME/Downloads/desktop.ini"
+
+    installer_fd_scan "$HOME/Downloads"
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"/Setup.exe"* ]] || return 1
+    [[ "$output" == *"/Tool.msi"* ]] || return 1
+    [[ "$output" != *"backup.tar.gz"* ]] || return 1
+    [[ "$output" != *"desktop.ini"* ]]
+}
+
+@test "installer (fd) lists an aged Chrome partial download and hides a fresh one" {
+    installer_use_fd_backend
+    installer_fd_reset_downloads
+    : > "$HOME/Downloads/.com.google.Chrome.AbC123"
+    : > "$HOME/Downloads/.com.google.Chrome.XyZ789"
+    : > "$HOME/Downloads/Movie.mp4.crdownload"
+    : > "$HOME/Downloads/Fresh.zip.crdownload"
+    : > "$HOME/Downloads/.com.google.Chrome.TooLong1"
+    touch -t "$(installer_fd_days_ago_stamp 30)" "$HOME/Downloads/.com.google.Chrome.AbC123" \
+        "$HOME/Downloads/Movie.mp4.crdownload" "$HOME/Downloads/.com.google.Chrome.TooLong1"
+
+    installer_fd_scan "$HOME/Downloads"
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"/.com.google.Chrome.AbC123"* ]] || return 1
+    [[ "$output" == *"/Movie.mp4.crdownload"* ]] || return 1
+    [[ "$output" != *"XyZ789"* ]] || return 1
+    [[ "$output" != *"Fresh.zip.crdownload"* ]] || return 1
+    [[ "$output" != *"TooLong1"* ]]
+}

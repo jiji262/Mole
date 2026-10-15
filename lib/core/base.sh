@@ -160,6 +160,9 @@ readonly MOLE_MAX_DS_STORE_FILES=500     # Max .DS_Store files to clean per scan
 readonly MOLE_MAX_ORPHAN_ITERATIONS=100  # Max iterations for orphaned app data scan
 readonly MOLE_ONE_GIB_KB=$((1024 * 1024))
 readonly MOLE_ONE_GB_BYTES=1000000000
+readonly MOLE_UPDATE_YML_MAX_BYTES=65536       # Largest electron-updater app-update.yml read
+readonly MOLE_UPDATE_PLIST_MAX_BYTES=1048576   # Largest staged Info.plist read out of an update zip
+readonly MOLE_UPDATE_APP_SCAN_MAX_BUNDLES=2000 # Installed app bundles inspected per updater-owner scan
 
 # ============================================================================
 # Whitelist Configuration
@@ -1072,6 +1075,42 @@ format_free_space_delta_kb() {
     fi
 
     printf '%s%s\n' "$sign" "$(bytes_to_human_kb "$abs_kb")"
+}
+
+# Is dotted numeric version $1 strictly older than $2? Missing trailing
+# components count as 0, so 1.2 equals 1.2.0, and 1.2 is older than 1.10.
+# 0 = older, 1 = equal or newer, 2 = unknown: not ^[0-9]+([.][0-9]+)*$, or a
+# component longer than 9 digits (arithmetic overflow on corrupt metadata).
+# Every component is validated before any comparison, so a long tail cannot
+# hide behind an earlier decisive component.
+mole_dotted_version_is_older() {
+    local candidate_version="$1"
+    local current_version="$2"
+    local version_pattern='^[0-9]{1,9}([.][0-9]{1,9})*$'
+    [[ "$candidate_version" =~ $version_pattern ]] || return 2
+    [[ "$current_version" =~ $version_pattern ]] || return 2
+
+    local saved_ifs="$IFS"
+    IFS='.'
+    # shellcheck disable=SC2206 # intentional numeric version split
+    local -a candidate_parts=($candidate_version)
+    # shellcheck disable=SC2206 # intentional numeric version split
+    local -a current_parts=($current_version)
+    IFS="$saved_ifs"
+
+    local count=${#candidate_parts[@]}
+    [[ ${#current_parts[@]} -gt $count ]] && count=${#current_parts[@]}
+    local index candidate_part current_part
+    for ((index = 0; index < count; index++)); do
+        candidate_part="${candidate_parts[$index]:-0}"
+        current_part="${current_parts[$index]:-0}"
+        if ((10#$candidate_part < 10#$current_part)); then
+            return 0
+        elif ((10#$candidate_part > 10#$current_part)); then
+            return 1
+        fi
+    done
+    return 1
 }
 
 mole_is_reverse_dns_bundle_id() {

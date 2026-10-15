@@ -548,3 +548,214 @@ setup() {
         [ "$status" -eq 0 ] || return 1
     done
 }
+
+# Downloads that are not .dmg/.pkg (U6): Parallels ISOs, Windows installers,
+# and stale Chrome partial downloads. All stay selection-only.
+
+installer_days_ago_stamp() {
+	date -v-"$1"d +%Y%m%d%H%M
+}
+
+# setup's Downloads/* glob skips dotfiles such as Chrome's temp names.
+installer_reset_downloads() {
+	rm -rf "${HOME:?}/Downloads"
+	mkdir -p "$HOME/Downloads"
+}
+
+@test "installer scans ~/Library/Parallels/Downloads for iso" {
+	installer_reset_downloads
+	mkdir -p "$HOME/Library/Parallels/Downloads"
+	printf 'iso' > "$HOME/Library/Parallels/Downloads/Win.iso"
+
+	run env HOME="$HOME" TERM="xterm-256color" MOLE_TEST_NO_AUTH=1 \
+		"$PROJECT_ROOT/mole" installer --dry-run < /dev/null
+
+	rm -rf "$HOME/Library/Parallels"
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"Win.iso"* ]] || return 1
+	[[ "$output" == *"Parallels"* ]] || return 1
+	[[ "$output" == *"0 selected"* ]]
+}
+
+@test "installer keeps the listed Parallels iso after a dry run" {
+	installer_reset_downloads
+	mkdir -p "$HOME/Library/Parallels/Downloads"
+	printf 'iso' > "$HOME/Library/Parallels/Downloads/Win.iso"
+
+	run env HOME="$HOME" TERM="xterm-256color" MOLE_TEST_NO_AUTH=1 \
+		"$PROJECT_ROOT/mole" installer --dry-run < /dev/null
+
+	local survived=no
+	[[ -f "$HOME/Library/Parallels/Downloads/Win.iso" ]] && survived=yes
+	rm -rf "$HOME/Library/Parallels"
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"Win.iso"* ]] || return 1
+	[ "$survived" = yes ]
+}
+
+@test "installer lists .exe and .msi installers unselected" {
+	installer_reset_downloads
+	printf 'exe' > "$HOME/Downloads/Setup.exe"
+	printf 'msi' > "$HOME/Downloads/Tool.msi"
+
+	run env HOME="$HOME" TERM="xterm-256color" MOLE_TEST_NO_AUTH=1 \
+		"$PROJECT_ROOT/mole" installer --dry-run < /dev/null
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"Setup.exe"* ]] || return 1
+	[[ "$output" == *"Tool.msi"* ]] || return 1
+	[[ "$output" == *"Windows installer"* ]] || return 1
+	[[ "$output" == *"Windows executable"* ]] || return 1
+	[[ "$output" == *"0 selected"* ]] || return 1
+	[[ -f "$HOME/Downloads/Setup.exe" ]] || return 1
+	[[ -f "$HOME/Downloads/Tool.msi" ]]
+}
+
+# An .exe or .msi carries no installer evidence of its own, so only a
+# download-origin root offers one. A portable tool or an app's own executable
+# kept under Documents, Desktop, Public or /Users/Shared is the user's file.
+@test "installer offers .exe and .msi only from download folders" {
+	installer_reset_downloads
+	mkdir -p "$HOME/Documents/Tools" "$HOME/Desktop" "$HOME/Downloads/Telegram Desktop" \
+		"$HOME/Library/Parallels/Downloads"
+	: > "$HOME/Documents/Tools/putty.exe"
+	: > "$HOME/Documents/Tools/Agent.msi"
+	: > "$HOME/Documents/Tools/Disk.dmg"
+	: > "$HOME/Desktop/game.exe"
+	: > "$HOME/Downloads/Telegram Desktop/Setup.exe"
+	: > "$HOME/Library/Parallels/Downloads/Tools.msi"
+
+	run env PATH="/usr/bin:/bin" /bin/bash -euo pipefail -c "
+        export MOLE_TEST_MODE=1
+        source \"\$1\"
+        for root in \"\$HOME/Documents\" \"\$HOME/Desktop\" \"\$HOME/Downloads\" \"\$HOME/Library/Parallels/Downloads\"; do
+            scan_installers_in_path \"\$root\" | tr '\0' '\n'
+        done
+    " bash "$PROJECT_ROOT/bin/installer.sh"
+
+	rm -rf "$HOME/Documents/Tools" "$HOME/Desktop/game.exe" "$HOME/Library/Parallels"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	# Control: the same Documents scan still lists a disk image.
+	[[ "$output" == *"/Documents/Tools/Disk.dmg"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"/Downloads/Telegram Desktop/Setup.exe"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"/Library/Parallels/Downloads/Tools.msi"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"putty.exe"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"Agent.msi"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"game.exe"* ]] || { echo "$output"; return 1; }
+}
+
+@test "installer lists an aged Chrome partial download and hides a fresh one" {
+	installer_reset_downloads
+	local old
+	old=$(installer_days_ago_stamp 30)
+	: > "$HOME/Downloads/.com.google.Chrome.AbC123"
+	: > "$HOME/Downloads/.com.google.Chrome.XyZ789"
+	: > "$HOME/Downloads/Movie.mp4.crdownload"
+	: > "$HOME/Downloads/Fresh.zip.crdownload"
+	: > "$HOME/Downloads/.com.google.Chrome.Short"
+	: > "$HOME/Downloads/.com.google.Chrome.TooLong1"
+	touch -t "$old" "$HOME/Downloads/.com.google.Chrome.AbC123" \
+		"$HOME/Downloads/Movie.mp4.crdownload" \
+		"$HOME/Downloads/.com.google.Chrome.Short" \
+		"$HOME/Downloads/.com.google.Chrome.TooLong1"
+
+	run env PATH="/usr/bin:/bin" /bin/bash -euo pipefail -c "
+        export MOLE_TEST_MODE=1
+        source \"\$1\"
+        scan_installers_in_path \"\$2\" | tr '\0' '\n'
+    " bash "$PROJECT_ROOT/bin/installer.sh" "$HOME/Downloads"
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"/.com.google.Chrome.AbC123"* ]] || return 1
+	[[ "$output" == *"/Movie.mp4.crdownload"* ]] || return 1
+	[[ "$output" != *"XyZ789"* ]] || return 1
+	[[ "$output" != *"Fresh.zip.crdownload"* ]] || return 1
+	[[ "$output" != *"Chrome.Short"* ]] || return 1
+	[[ "$output" != *"TooLong1"* ]]
+}
+
+@test "installer labels a stale partial download with its age" {
+	installer_reset_downloads
+	: > "$HOME/Downloads/.com.google.Chrome.AbC123"
+	touch -t "$(installer_days_ago_stamp 30)" "$HOME/Downloads/.com.google.Chrome.AbC123"
+
+	run env HOME="$HOME" TERM="xterm-256color" MOLE_TEST_NO_AUTH=1 \
+		"$PROJECT_ROOT/mole" installer --dry-run < /dev/null
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *".com.google.Chrome.AbC123"* ]] || return 1
+	[[ "$output" == *"Partial download · 30d"* ]] || return 1
+	[[ "$output" == *"0 selected"* ]] || return 1
+	[[ -f "$HOME/Downloads/.com.google.Chrome.AbC123" ]]
+}
+
+@test "installer does not list .tar.gz or desktop.ini" {
+	installer_reset_downloads
+	mkdir -p "$HOME/Downloads/\$RECYCLE.BIN" "$HOME/Downloads/Tool.app/Contents"
+	: > "$HOME/Downloads/backup.tar.gz"
+	: > "$HOME/Downloads/source.tgz"
+	: > "$HOME/Downloads/desktop.ini"
+	: > "$HOME/Downloads/~\$Report.docx"
+	: > "$HOME/Downloads/\$RECYCLE.BIN/Old.exe"
+	: > "$HOME/Downloads/.Claude-1.0.dmg.js"
+	touch -t "$(installer_days_ago_stamp 30)" "$HOME/Downloads/.Claude-1.0.dmg.js"
+
+	run env PATH="/usr/bin:/bin" /bin/bash -euo pipefail -c "
+        export MOLE_TEST_MODE=1
+        source \"\$1\"
+        scan_installers_in_path \"\$2\" | tr '\0' '\n'
+    " bash "$PROJECT_ROOT/bin/installer.sh" "$HOME/Downloads"
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" != *"backup.tar.gz"* ]] || return 1
+	[[ "$output" != *"source.tgz"* ]] || return 1
+	[[ "$output" != *"desktop.ini"* ]] || return 1
+	[[ "$output" != *"Report.docx"* ]] || return 1
+	[[ "$output" != *"Tool.app"* ]] || return 1
+	[[ "$output" != *"Claude-1.0.dmg.js"* ]]
+}
+
+@test "installer deletes a selected stale partial download only while its identity holds" {
+	installer_reset_downloads
+	local old
+	old=$(installer_days_ago_stamp 30)
+	local stale="$HOME/Downloads/.com.google.Chrome.AbC123"
+	local revived="$HOME/Downloads/Paused.crdownload"
+	local swapped="$HOME/Downloads/.com.google.Chrome.SwP456"
+	printf 'part' > "$stale"
+	printf 'part' > "$revived"
+	printf 'part' > "$swapped"
+	printf 'part' > "$swapped.new"
+	touch -t "$old" "$stale" "$revived" "$swapped" "$swapped.new"
+
+	# shellcheck disable=SC2016
+	run env HOME="$HOME" TERM="$TERM" /bin/bash -euo pipefail -c '
+        export MOLE_TEST_MODE=1
+        export MOLE_TEST_NO_AUTH=1
+        export MOLE_DELETE_LOG="$HOME/deletions.log"
+        source "$1"
+
+        INSTALLER_PATHS=("$2" "$3" "$4")
+        INSTALLER_SIZES=(4 4 4)
+        # Chrome resumed the paused download after the scan listed it.
+        touch "$3"
+        build_installer_delete_plan 0 1 2 || true
+        # Another file took the selected name before confirmation.
+        /bin/mv "$4.new" "$4"
+
+        set +e
+        execute_installer_delete_plan
+        rc=$?
+        set -e
+        printf "rc=%s deleted=%s failed=%s\n" "$rc" "$total_deleted" "$total_delete_failed"
+        printf "failure=%s\n" "${INSTALLER_DELETE_FAILURES[@]}"
+        [[ ! -e "$2" ]] || exit 1
+        [[ -f "$3" && -f "$4" ]] || exit 1
+    ' bash "$PROJECT_ROOT/bin/installer.sh" "$stale" "$revived" "$swapped"
+
+	rm -f "$revived" "$swapped"
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"rc=3 deleted=1 failed=2"* ]] || return 1
+	[[ "$output" == *"Paused.crdownload (changed since scan)"* ]] || return 1
+	[[ "$output" == *".com.google.Chrome.SwP456 (changed since scan)"* ]]
+}

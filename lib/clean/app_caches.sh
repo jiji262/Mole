@@ -898,6 +898,237 @@ clean_wechat_container_caches() {
     fi
 }
 
+# QQ (NT) ships sandboxed like WeChat; QQ docs (QQEXDOC) is a Chromium
+# user-data-dir in its own container. Measured on macOS 15 with QQ 6.9.98:
+#   Q/nt_qq_<32 hex>/nt_data/log                1.3-5.2 MB per account
+#   Q/log, Q/global/nt_data/Log/log             0.5 MB
+#   QQEX users/<uin>/{Cache,Code Cache,...}     68 MB
+#   QQEX users/<uin>/Service Worker/CacheStorage 118 MB
+#   Q/versions/<curVersion>.zip                 1.2 GB class when present
+# where Q = Containers/com.tencent.qq/Data/Library/Application Support/QQ.
+#
+# Non-targets: nt_db and every *.db / -wal / -shm, Cookies, Local Storage,
+# versions/<v> directories (the active one included), versions/*.json, a zip
+# that is not curVersion or is readyVersion, global config, Data/tmp (pasted
+# and received images that may be the only local copy), and the qqexguild and
+# qqexminiprogram containers, whose layout is unverified.
+qq_running() {
+    # QQUpdate and the QQEX* helper apps run from the container's versions/
+    # directory, not from QQ.app, so the container path is probed too.
+    mole_pgrep_any \
+        -x "QQ" \
+        -x "QQEXDOC" \
+        -f '/QQ[.]app/Contents/' \
+        -f '/Containers/com[.]tencent[.]qq/Data/'
+}
+
+_qq_container_process_guard_allows() {
+    mole_clean_process_guard qq_running "QQ started"
+}
+
+_qq_support_root() {
+    printf '%s\n' "$HOME/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"
+}
+
+_qqex_users_root() {
+    printf '%s\n' "$HOME/Library/Containers/com.tencent.qqexdoc/Data/Library/Application Support/QQEX/users"
+}
+
+# Container Data directory owning an allow-listed QQ cache root. 1 = the root
+# is not one of the exact shapes cleaned below.
+_qq_cache_root_container() {
+    local root="$1" q users relative user
+    q=$(_qq_support_root)
+    users=$(_qqex_users_root)
+    case "$root" in
+        "$q/log" | "$q/global/nt_data/Log/log")
+            printf '%s\n' "$HOME/Library/Containers/com.tencent.qq/Data"
+            return 0
+            ;;
+    esac
+    if [[ "$root" == "$q"/nt_qq_*/nt_data/log ]]; then
+        relative="${root#"$q"/}"
+        [[ "${relative%/nt_data/log}" =~ ^nt_qq_[0-9a-f]{32}$ ]] || return 1
+        printf '%s\n' "$HOME/Library/Containers/com.tencent.qq/Data"
+        return 0
+    fi
+    [[ "$root" == "$users"/* ]] || return 1
+    relative="${root#"$users"/}"
+    user="${relative%%/*}"
+    [[ "$user" =~ ^[0-9]+$ ]] || return 1
+    case "${relative#*/}" in
+        "Cache" | "Code Cache" | "GPUCache" | "DawnWebGPUCache" | "DawnGraphiteCache") ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$HOME/Library/Containers/com.tencent.qqexdoc/Data"
+}
+
+_qq_container_delete_guard_allows() {
+    local path="$1"
+    _qq_container_process_guard_allows || return $?
+    local cache_root="${path%/*}" container_data=""
+    container_data=$(_qq_cache_root_container "$cache_root") || return 1
+    _messaging_container_bind_candidate "$path" "$cache_root" "$container_data"
+}
+
+# Log and QQ docs cache roots as root|label pairs into _QQ_TARGETS.
+_qq_collect_targets() {
+    local q users account user leaf
+    q=$(_qq_support_root)
+    users=$(_qqex_users_root)
+    _QQ_TARGETS=("$q/log" "QQ logs" "$q/global/nt_data/Log/log" "QQ logs")
+    for account in "$q"/nt_qq_*; do
+        [[ "${account##*/}" =~ ^nt_qq_[0-9a-f]{32}$ ]] || continue
+        [[ -d "$account" && ! -L "$account" ]] || continue
+        _QQ_TARGETS+=("$account/nt_data/log" "QQ account logs")
+    done
+    [[ -d "$users" && ! -L "$users" ]] || return 0
+    for user in "$users"/*; do
+        [[ "${user##*/}" =~ ^[0-9]+$ ]] || continue
+        [[ -d "$user" && ! -L "$user" ]] || continue
+        _QQ_USERS+=("$user")
+        for leaf in "Cache" "Code Cache" "GPUCache" "DawnWebGPUCache" "DawnGraphiteCache"; do
+            _QQ_TARGETS+=("$user/$leaf" "QQ docs $leaf")
+        done
+    done
+}
+
+# Anything a real run would touch: a root with an eligible child, a QQ docs
+# CacheStorage entry, or the installed-version archive.
+_qq_has_eligible_targets() {
+    local index user sw
+    for ((index = 0; index < ${#_QQ_TARGETS[@]}; index += 2)); do
+        [[ -d "${_QQ_TARGETS[$index]}" && ! -L "${_QQ_TARGETS[$index]}" ]] || continue
+        mole_cleanup_targets_exist "${_QQ_TARGETS[$index]}"/* && return 0
+    done
+    for user in ${_QQ_USERS[@]+"${_QQ_USERS[@]}"}; do
+        sw="$user/Service Worker/CacheStorage"
+        [[ -d "$sw" && ! -L "$sw" && ! -L "${sw%/*}" ]] || continue
+        mole_cleanup_targets_exist "$sw"/* && return 0
+    done
+    _qq_current_archive_path > /dev/null
+}
+
+# QQ docs Service Worker CacheStorage through the cleaner that keeps
+# protected web editors and whitelisted origins.
+_qq_clean_qqex_service_workers() {
+    local user sw guarded_rc
+    declare -f clean_service_worker_cache > /dev/null 2>&1 || return 0
+    for user in ${_QQ_USERS[@]+"${_QQ_USERS[@]}"}; do
+        sw="$user/Service Worker/CacheStorage"
+        [[ -d "$sw" && ! -L "$sw" && ! -L "${sw%/*}" ]] || continue
+        guarded_rc=0
+        clean_service_worker_cache "QQ docs" "$sw" _qq_container_process_guard_allows || guarded_rc=$?
+        if [[ $guarded_rc -eq 75 ]]; then
+            mole_report_guard_stop "QQ container caches" mole_defer_cleanup_family "QQ"
+            return 0
+        fi
+        mole_rc_timeout_or_signal "$guarded_rc" && return "$guarded_rc"
+    done
+    return 0
+}
+
+clean_qq_container_caches() {
+    [[ -d "$HOME/Library/Containers/com.tencent.qq/Data" ||
+        -d "$HOME/Library/Containers/com.tencent.qqexdoc/Data" ]] || return 0
+    local -a _QQ_TARGETS=() _QQ_USERS=()
+    _qq_collect_targets
+    _qq_has_eligible_targets || return 0
+
+    local _MOLE_CLEAN_GUARD_REASON=""
+    if ! _qq_container_process_guard_allows; then
+        mole_report_guard_stop "QQ container caches" mole_defer_cleanup_family "QQ"
+        return 0
+    fi
+    local rc=0
+    _clean_messaging_container_roots "QQ" \
+        _qq_container_process_guard_allows \
+        _qq_container_delete_guard_allows \
+        "${_QQ_TARGETS[@]}" || rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    _qq_clean_qqex_service_workers || return $?
+    clean_qq_current_version_archive
+}
+
+# Q/versions/<v>.zip is the download QQ unpacked into Q/versions/<v>. Only the
+# archive of the version QQ runs now (config.json curVersion, not also its
+# readyVersion) is redundant; any other zip may be the only copy of a staged
+# update. Complete-visibility lsof is not used: without sudo it always answers
+# unknown and would make this row inert. QQ itself is the only writer, and
+# its tri-state process probe guards the sink together with a fresh read of
+# config.json and the unpacked sibling.
+_qq_archive_version_ok() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)*-[0-9]+$ ]]
+}
+
+# One raw string from config.json. An empty value is valid (readyVersion "").
+_qq_versions_config_value() {
+    local config="$1" key="$2"
+    [[ -f "$config" && ! -L "$config" ]] || return 1
+    run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        plutil -extract "$key" raw -o - "$config" < /dev/null 2> /dev/null
+}
+
+# A real versions/<v> directory holding at least one real <Name>.app/Contents.
+_qq_unpacked_version_ok() {
+    local dir="$1" app
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    for app in "$dir"/*.app; do
+        [[ -d "$app" && ! -L "$app" ]] || continue
+        [[ -d "$app/Contents" && ! -L "$app/Contents" ]] && return 0
+    done
+    return 1
+}
+
+# Older than MOLE_TEMP_FILE_AGE_DAYS, so it is not a download in flight.
+_qq_archive_aged() {
+    local zip="$1" match=""
+    match=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" find "$zip" -maxdepth 0 -type f \
+        -mtime +"$MOLE_TEMP_FILE_AGE_DAYS" -print < /dev/null 2> /dev/null) || return 1
+    [[ "$match" == "$zip" ]]
+}
+
+# Print versions/<curVersion>.zip when every fact above holds. 1 = keep.
+_qq_current_archive_path() {
+    local versions cur ready zip
+    versions="$(_qq_support_root)/versions"
+    [[ -d "$versions" && ! -L "$versions" ]] || return 1
+    cur=$(_qq_versions_config_value "$versions/config.json" curVersion) || return 1
+    _qq_archive_version_ok "$cur" || return 1
+    ready=$(_qq_versions_config_value "$versions/config.json" readyVersion) || return 1
+    [[ "$ready" != "$cur" ]] || return 1
+    zip="$versions/$cur.zip"
+    [[ -f "$zip" && ! -L "$zip" ]] || return 1
+    _qq_unpacked_version_ok "$versions/$cur" || return 1
+    _qq_archive_aged "$zip" || return 1
+    printf '%s\n' "$zip"
+}
+
+_qq_archive_delete_guard_allows() {
+    local path="$1" current=""
+    _qq_container_process_guard_allows || return $?
+    current=$(_qq_current_archive_path) || return 1
+    [[ "$path" == "$current" ]] || return 1
+    _messaging_container_bind_candidate "$path" "${path%/*}" \
+        "$HOME/Library/Containers/com.tencent.qq/Data"
+}
+
+clean_qq_current_version_archive() {
+    local zip=""
+    zip=$(_qq_current_archive_path) || return 0
+    local _MOLE_CLEAN_GUARD_REASON="QQ version archive changed"
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_qq_archive_delete_guard_allows
+    local guarded_rc=0
+    safe_clean_guarded _qq_archive_delete_guard_allows "$zip" \
+        "QQ installed version archive" || guarded_rc=$?
+    [[ $guarded_rc -eq 75 ]] || return "$guarded_rc"
+    if [[ "$_MOLE_CLEAN_GUARD_REASON" == "QQ version archive changed" ]]; then
+        debug_log "QQ version archive no longer matches curVersion, keep: $zip"
+        return 0
+    fi
+    mole_report_guard_stop "QQ installed version archive" mole_defer_cleanup_family "QQ"
+}
+
 # Communication apps.
 clean_communication_apps() {
     safe_clean ~/Library/Application\ Support/discord/Cache/* "Discord cache"
@@ -930,6 +1161,7 @@ clean_communication_apps() {
         safe_clean ~/Library/Application\ Support/Microsoft/Teams/tmp/* "Microsoft Teams legacy temp files"
     fi
     clean_wechat_container_caches
+    clean_qq_container_caches
 }
 # DingTalk.
 clean_dingtalk() {
@@ -1151,35 +1383,9 @@ _autodesk_fusion_version_dir_version() {
     _MOLE_AUTODESK_FUSION_APP="$app_candidate"
 }
 
+# Fusion keeps its own name as the test surface; the comparison is shared.
 _autodesk_fusion_version_is_older() {
-    local candidate_version="$1"
-    local current_version="$2"
-    [[ "$candidate_version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
-    [[ "$current_version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
-
-    local saved_ifs="$IFS"
-    IFS='.'
-    # shellcheck disable=SC2206 # intentional numeric version split
-    local -a candidate_parts=($candidate_version)
-    # shellcheck disable=SC2206 # intentional numeric version split
-    local -a current_parts=($current_version)
-    IFS="$saved_ifs"
-
-    local count=${#candidate_parts[@]}
-    [[ ${#current_parts[@]} -gt $count ]] && count=${#current_parts[@]}
-    local index candidate_part current_part
-    for ((index = 0; index < count; index++)); do
-        candidate_part="${candidate_parts[$index]:-0}"
-        current_part="${current_parts[$index]:-0}"
-        # Avoid arithmetic overflow on corrupt metadata. Unknown is retained.
-        [[ ${#candidate_part} -le 9 && ${#current_part} -le 9 ]] || return 1
-        if ((10#$candidate_part < 10#$current_part)); then
-            return 0
-        elif ((10#$candidate_part > 10#$current_part)); then
-            return 1
-        fi
-    done
-    return 1
+    mole_dotted_version_is_older "$1" "$2"
 }
 
 _autodesk_fusion_resolve_current_dir() {
@@ -1980,6 +2186,153 @@ clean_remote_desktop() {
     safe_clean ~/Library/Caches/com.todesk.*/* "ToDesk cache"
     safe_clean ~/Library/Caches/com.sunlogin.*/* "Sunlogin cache"
 }
+# Superseded staged app bundles under Application Support/<dir>/updates.
+# Quark and Qianwen (Tongyi) download the next release as a complete <App>.app
+# next to their DMG installer scaffolding, apply it on relaunch, and leave the
+# copy behind. Measured: Quark 1.0 GB, Qianwen 597 MB.
+# Only <App>.app goes, and only when all of these hold at the delete boundary:
+#   - no symlink at <dir>, updates or <App>.app, and the physical path stays
+#     under the physical ~/Library/Application Support;
+#   - the staged and the uniquely installed bundle both report the table's id,
+#     and the installed one is at least as new on CFBundleShortVersionString
+#     and CFBundleVersion (a newer staged bundle is a pending update);
+#   - neither bundle is referenced by a running process;
+#   - the staged bundle and its direct children are older than
+#     MOLE_TEMP_FILE_AGE_DAYS, so a copy in progress is never judged.
+# Non-targets: updates/ itself, .install, .background, .VolumeIcon.icns,
+# .DS_Store, every other child of the support directory (sessions, cookies,
+# databases), and staged layouts not in this table (Qoder's updates/v1,
+# TokenTrackerBar's .dmg.part).
+if ! declare -p MOLE_STAGED_APP_UPDATE_TABLE > /dev/null 2>&1; then
+    readonly MOLE_STAGED_APP_UPDATE_TABLE=(
+        "Quark|Quark.app|com.quark.desktop"
+        "Qianwen|Qianwen.app|com.alibaba.tongyi"
+    )
+fi
+
+_STAGED_APP_UPDATE_PROBE_PATHS=()
+_STAGED_APP_UPDATE_PHYSICAL_PARENT=""
+
+# Table row for one staged candidate path: "<dir>|<App>.app|<id>".
+_staged_app_update_row_for_path() {
+    local path="$1" row dir app_name
+    local support="$HOME/Library/Application Support"
+    for row in "${MOLE_STAGED_APP_UPDATE_TABLE[@]}"; do
+        dir="${row%%|*}"
+        app_name="${row#*|}"
+        app_name="${app_name%%|*}"
+        if [[ "$path" == "$support/$dir/updates/$app_name" ]]; then
+            printf '%s\n' "$row"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Containment: no symlink on <dir>/updates/<App>.app, and the physical updates
+# directory is exactly <physical Application Support>/<dir>/updates.
+_staged_app_update_contained() {
+    local path="$1" dir="$2"
+    local support="$HOME/Library/Application Support"
+    local updates="$support/$dir/updates"
+    _STAGED_APP_UPDATE_PHYSICAL_PARENT=""
+    [[ "${path%/*}" == "$updates" ]] || return 1
+    [[ -d "$support/$dir" && ! -L "$support/$dir" ]] || return 1
+    [[ -d "$updates" && ! -L "$updates" ]] || return 1
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    local physical_support="" physical_updates=""
+    physical_support=$(cd -P "$support" 2> /dev/null && pwd -P) || return 1
+    physical_updates=$(cd -P "$updates" 2> /dev/null && pwd -P) || return 1
+    [[ "$physical_updates" == "${physical_support%/}/$dir/updates" ]] || return 1
+    _STAGED_APP_UPDATE_PHYSICAL_PARENT="$physical_updates"
+}
+
+# 0 = the bundle and its direct children are older than MOLE_TEMP_FILE_AGE_DAYS.
+# 1 = something is newer, or the bounded probe could not tell.
+_staged_app_update_settled() {
+    local recent="" rc=0
+    recent=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        find -P "$1" -maxdepth 1 -mtime -"$MOLE_TEMP_FILE_AGE_DAYS" -print -quit \
+        < /dev/null 2> /dev/null) || rc=$?
+    [[ $rc -eq 0 && -z "$recent" ]]
+}
+
+# Every non-process fact for one candidate. 0 = eligible, 1 = keep.
+_staged_app_update_evidence_holds() {
+    local path="$1" row="" dir bundle_id
+    row=$(_staged_app_update_row_for_path "$path") || return 1
+    dir="${row%%|*}"
+    bundle_id="${row##*|}"
+    _staged_app_update_contained "$path" "$dir" || return 1
+    _staged_app_update_settled "$path" || return 1
+    local verdict=0
+    mole_staged_app_bundle_verdict "$path" "$bundle_id" || verdict=$?
+    [[ $verdict -eq 1 ]] || return 1
+    _STAGED_APP_UPDATE_PROBE_PATHS=("$path/Contents")
+    local app
+    for app in "${_MOLE_UPDATE_MATCHED_APPS[@]}"; do
+        _STAGED_APP_UPDATE_PROBE_PATHS+=("$app/Contents")
+    done
+}
+
+# Tri-state for mole_clean_process_guard: argv naming either bundle's Contents.
+_staged_app_update_process_state() {
+    [[ ${#_STAGED_APP_UPDATE_PROBE_PATHS[@]} -gt 0 ]] || return 2
+    mole_process_args_reference_paths --fresh "${_STAGED_APP_UPDATE_PROBE_PATHS[@]}"
+}
+
+# Delete guard and final sink guard: re-evaluate ids, versions, age and the
+# process, then bind the exact object for safe_remove.
+_staged_app_update_delete_guard() {
+    local path="$1"
+    _STAGED_APP_UPDATE_PROBE_PATHS=()
+    if ! _staged_app_update_evidence_holds "$path"; then
+        _MOLE_CLEAN_GUARD_REASON="staged update changed"
+        return 1
+    fi
+    mole_clean_process_guard _staged_app_update_process_state "app running" || return 1
+    _mole_snapshot_path_identity "$path" || return 1
+    [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "$_STAGED_APP_UPDATE_PHYSICAL_PARENT" ]] || return 1
+    _MOLE_SAFE_CLEAN_BOUND_PATH="$path"
+    _MOLE_SAFE_CLEAN_EXPECTED_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+    _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+    _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+}
+
+clean_superseded_staged_app_updates() {
+    local row dir app_name candidate
+    local support="$HOME/Library/Application Support"
+    for row in "${MOLE_STAGED_APP_UPDATE_TABLE[@]}"; do
+        dir="${row%%|*}"
+        app_name="${row#*|}"
+        app_name="${app_name%%|*}"
+        candidate="$support/$dir/updates/$app_name"
+        [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+        # A pending, unreadable or still-settling bundle is kept quietly.
+        _staged_app_update_evidence_holds "$candidate" || continue
+        _clean_one_staged_app_update "$candidate" "$dir" || return $?
+    done
+    return 0
+}
+
+_clean_one_staged_app_update() {
+    local candidate="$1" family="$2"
+    local _MOLE_CLEAN_GUARD_REASON=""
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_staged_app_update_delete_guard
+    local guarded_rc=0
+    safe_clean_guarded _staged_app_update_delete_guard \
+        "$candidate" "$family staged update" || guarded_rc=$?
+    if [[ $guarded_rc -eq 75 ]]; then
+        if [[ "$_MOLE_CLEAN_GUARD_REASON" == "staged update changed" ]]; then
+            debug_log "Staged update changed before removal, kept: $candidate"
+        else
+            mole_report_guard_stop "$family staged update" mole_defer_cleanup_family "$family"
+        fi
+        return 0
+    fi
+    return "$guarded_rc"
+}
+
 # Main entry for GUI app cleanup.
 clean_user_gui_applications() {
     # Product and media App Container rows share one recursive-handle budget.
@@ -1993,9 +2346,11 @@ clean_user_gui_applications() {
         clean_media_players clean_video_players clean_download_managers \
         clean_gaming_platforms clean_translation_apps clean_screenshot_tools \
         clean_email_clients clean_task_apps clean_shell_utils clean_system_utils \
-        clean_note_apps clean_launcher_apps clean_remote_desktop; do
+        clean_note_apps clean_launcher_apps clean_remote_desktop \
+        clean_superseded_staged_app_updates; do
         start_section_spinner "Scanning apps..."
-        if [[ "$app_group" == "clean_download_managers" ]]; then
+        if [[ "$app_group" == "clean_download_managers" ||
+            "$app_group" == "clean_superseded_staged_app_updates" ]]; then
             group_rc=0
             "$app_group" || group_rc=$?
             if [[ $group_rc -ne 0 ]]; then

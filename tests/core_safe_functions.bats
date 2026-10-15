@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 load helpers/common
+load helpers/staged_updates
 
 setup_file() {
     mole_test_setup_home safe-functions
@@ -3560,6 +3561,137 @@ EOF
     [[ "$output" == *"UNREADABLE=2"* ]]
 }
 
+# The argv probe behind npx (and later per-path) cleanup guards. It must match
+# a path as literal bytes, never as a pattern: '.', '+', '[' and spaces are
+# ordinary characters in cache paths, and a regex escape of every byte is
+# undefined in ERE. A path counts only when a delimiter follows it, so a
+# sibling that merely shares its prefix is not a reference.
+# A path inside a comma-, colon- or semicolon-separated argument (an allow
+# list, a PATH-style search list) is still a reference.
+@test "mole_process_args_reference_paths treats list separators as delimiters" {
+    local root="$TEST_DIR/argv lists"
+    mkdir -p "$root/comma" "$root/colon" "$root/semi" "$root/commax"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/file_ops.sh"
+ps() {
+    [[ "$*" == *args* ]] || return 0
+    printf '  PID  PPID COMM ARGS\n'
+    printf '  901     1 node node --allow-dir=%s,/tmp/other\n' "$ROOT/comma"
+    printf '  902     1 node node --search %s:/tmp/other\n' "$ROOT/colon"
+    printf '  903     1 node node --paths=%s;/tmp/other\n' "$ROOT/semi"
+}
+probe() {
+    local state=0
+    mole_process_args_reference_paths --fresh "$@" || state=$?
+    printf '%s\n' "$state"
+}
+printf 'COMMA=%s\n' "$(probe "$ROOT/comma")"
+printf 'COLON=%s\n' "$(probe "$ROOT/colon")"
+printf 'SEMI=%s\n' "$(probe "$ROOT/semi")"
+printf 'PREFIX=%s\n' "$(probe "$ROOT/comm")"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"COMMA=0"* ]] || return 1
+    [[ "$output" == *"COLON=0"* ]] || return 1
+    [[ "$output" == *"SEMI=0"* ]] || return 1
+    [[ "$output" == *"PREFIX=1"* ]]
+}
+
+@test "mole_process_args_reference_paths matches literally" {
+    local root="$TEST_DIR/argv probe"
+    mkdir -p "$root/a.b+c[d]" "$root/a/abc" "$root/a/abcd" "$root/eq" "$root/q" "$root/eol" "$root/real"
+    ln -s "$root/real" "$root/link"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/file_ops.sh"
+ps_table="base"
+ps() {
+    [[ "$*" == *args* ]] || return 0
+    printf '  PID  PPID COMM ARGS\n'
+    printf '  %s     1 bash bash mo clean %s\n' "$$" "$ROOT/a/abc"
+    case "$ps_table" in
+        base)
+            printf '  801     1 node node %s/x.js\n' "$ROOT/a.b+c[d]"
+            printf '  802     1 node node %s/abcd/bin\n' "$ROOT/a"
+            printf '  803     1 chrome chrome --user-data-dir=%s\n' "$ROOT/eq"
+            printf '  804     1 node node "%s"\n' "$ROOT/q"
+            printf '  805     1 node node --cwd %s\n' "$ROOT/eol"
+            printf '  806     1 node node %s/index.js\n' "$ROOT/real"
+            printf '  808     1 node node %s/x.js\n' "$ROOT/zXbbcd"
+            ;;
+        changed)
+            printf '  807     1 node node %s --serve\n' "$ROOT/a/abc"
+            ;;
+    esac
+}
+probe() {
+    local state=0
+    mole_process_args_reference_paths "$@" || state=$?
+    printf '%s\n' "$state"
+}
+printf 'META=%s\n' "$(probe "$ROOT/a.b+c[d]")"
+# As an ERE this would match the zXbbcd line above.
+printf 'REGEX_LOOKALIKE=%s\n' "$(probe "$ROOT/z.b+c[d]")"
+printf 'PREFIX_SIBLING=%s\n' "$(probe "$ROOT/a/abc")"
+printf 'SLASH=%s\n' "$(probe "$ROOT/a/abcd")"
+printf 'EQUALS=%s\n' "$(probe "$ROOT/eq")"
+printf 'QUOTE=%s\n' "$(probe "$ROOT/q")"
+printf 'EOL=%s\n' "$(probe "$ROOT/eol/")"
+printf 'PHYSICAL=%s\n' "$(probe "$ROOT/link")"
+printf 'ANY=%s\n' "$(probe "$ROOT/a/abc" "$ROOT/eq")"
+
+_MOLE_USER_CACHE_OWNER_STATE_CACHE="|sentinel:1|"
+state=0
+mole_process_args_reference_paths "$ROOT/a/abc" || state=$?
+printf 'MEMO_BEFORE=%s\n' "$state"
+ps_table="changed"
+state=0
+mole_process_args_reference_paths "$ROOT/a/abc" || state=$?
+printf 'MEMO_AFTER=%s\n' "$state"
+state=0
+mole_process_args_reference_paths --fresh "$ROOT/a/abc" || state=$?
+printf 'FRESH=%s\n' "$state"
+printf 'OWNER_CACHE=%s\n' "$_MOLE_USER_CACHE_OWNER_STATE_CACHE"
+
+ps() { return 1; }
+state=0
+mole_process_args_reference_paths --fresh "$ROOT/a/abc" || state=$?
+printf 'PS_FAILED=%s\n' "$state"
+ps() { [[ "$*" == *args* ]] || return 0; printf '  PID  PPID COMM ARGS\n'; }
+state=0
+mole_process_args_reference_paths --fresh "$ROOT/a/abc" || state=$?
+printf 'EMPTY_TABLE=%s\n' "$state"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"META=0"* ]] || return 1
+    [[ "$output" == *"REGEX_LOOKALIKE=1"* ]] || return 1
+    # Only Mole's own argv names a/abc, and a/abcd must not count for it.
+    [[ "$output" == *"PREFIX_SIBLING=1"* ]] || return 1
+    [[ "$output" == *"SLASH=0"* ]] || return 1
+    [[ "$output" == *"EQUALS=0"* ]] || return 1
+    [[ "$output" == *"QUOTE=0"* ]] || return 1
+    [[ "$output" == *"EOL=0"* ]] || return 1
+    [[ "$output" == *"PHYSICAL=0"* ]] || return 1
+    [[ "$output" == *"ANY=0"* ]] || return 1
+    [[ "$output" == *"MEMO_BEFORE=1"* ]] || return 1
+    [[ "$output" == *"MEMO_AFTER=1"* ]] || return 1
+    [[ "$output" == *"FRESH=0"* ]] || return 1
+    [[ "$output" == *"OWNER_CACHE=|sentinel:1|"* ]] || return 1
+    [[ "$output" == *"PS_FAILED=2"* ]] || return 1
+    [[ "$output" == *"EMPTY_TABLE=2"* ]]
+}
+
 @test "SQLite handle timeout keeps the file without cancelling later cleanup (#1595)" {
     local database="$TEST_DIR/timeout.sqlite"
     printf 'database' > "$database"
@@ -3718,4 +3850,325 @@ done
 EOF
 
     [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
+# ----------------------------------------------------------------------------
+# Pending app updates inside the ~/Library/Caches sweep
+# ----------------------------------------------------------------------------
+
+# Run the live user-cache guard (and the validator) in a fixture HOME with a
+# scripted process table. $3, when set, is an executable shown as running.
+u3_run_guard() {
+    local fixture_home="$1" target="$2" running="${3:-}"
+    mkdir -p "$fixture_home/SystemApplications"
+    run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        MOLE_TEST_APPLICATIONS_DIR="$fixture_home/SystemApplications" \
+        MOLE_UNINSTALL_MODE="${U3_UNINSTALL_MODE:-0}" \
+        target="$target" RUNNING="$running" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+ps() {
+    [[ "$*" == *args* ]] || return 0
+    printf '  PID  PPID COMM ARGS\n'
+    printf '  900     1 /usr/sbin/cfprefsd /usr/sbin/cfprefsd agent\n'
+    [[ -z "$RUNNING" ]] || printf '  901     1 %s %s\n' "$RUNNING" "$RUNNING"
+}
+state=0
+_mole_should_refuse_live_user_cache_path "$target" || state=$?
+validation=0
+validate_path_for_deletion "$target" || validation=$?
+printf 'GUARD=%s VALID=%s\n' "$state" "$validation"
+EOF
+}
+
+@test "live cache guard keeps a ShipIt cache holding a newer staged update" {
+    local fixture="$TEST_DIR/u3-shipit-newer"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$fixture/Library/Caches/com.foo.ShipIt/update.ABC/Foo.app" com.foo 1.1 110
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard allows a ShipIt cache whose staged bundle equals the installed version" {
+    local fixture="$TEST_DIR/u3-shipit-equal"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$fixture/Library/Caches/com.foo.ShipIt/update.ABC/Foo.app" com.foo 1.0 100
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]]
+}
+
+@test "live cache guard keeps a ShipIt cache while the installed app runs" {
+    local fixture="$TEST_DIR/u3-shipit-running"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$fixture/Library/Caches/com.foo.ShipIt/update.ABC/Foo.app" com.foo 0.9 90
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt" \
+        "$fixture/Applications/Foo.app/Contents/MacOS/Foo"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard keeps a ShipIt cache when the staged id differs" {
+    local fixture="$TEST_DIR/u3-shipit-id"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$fixture/Library/Caches/com.foo.ShipIt/update.ABC/Foo.app" com.other 1.0 100
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard keeps a ShipIt cache when the staged Info.plist is a symlink" {
+    local fixture="$TEST_DIR/u3-shipit-symlink"
+    local staged="$fixture/Library/Caches/com.foo.ShipIt/update.ABC/Foo.app"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$fixture/elsewhere/Foo.app" com.foo 1.0 100
+    mkdir -p "$staged/Contents"
+    ln -s "$fixture/elsewhere/Foo.app/Contents/Info.plist" "$staged/Contents/Info.plist"
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard keeps a ShipIt cache when two installed copies disagree" {
+    local fixture="$TEST_DIR/u3-shipit-copies"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$fixture/SystemApplications/Tools/Foo Beta.app" com.foo 0.9 90
+    staged_update_make_bundle "$fixture/Library/Caches/com.foo.ShipIt/update.ABC/Foo.app" com.foo 1.0 100
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard keeps today's behaviour for a ShipIt cache with nothing staged" {
+    local fixture="$TEST_DIR/u3-shipit-empty"
+    mkdir -p "$fixture/Library/Caches/com.foo.ShipIt"
+    printf 'state\n' > "$fixture/Library/Caches/com.foo.ShipIt/ShipItState.plist"
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]]
+}
+
+@test "live cache guard keeps a dot-less updater cache while its declaring app runs" {
+    local fixture="$TEST_DIR/u3-updater-running"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    printf 'provider: generic\nupdaterCacheDirName: foo-updater\n' \
+        > "$fixture/Applications/Foo.app/Contents/Resources/app-update.yml"
+    mkdir -p "$fixture/Library/Caches/foo-updater"
+    printf 'zip\n' > "$fixture/Library/Caches/foo-updater/update.zip"
+    u3_run_guard "$fixture" "$fixture/Library/Caches/foo-updater" \
+        "$fixture/Applications/Foo.app/Contents/MacOS/Foo"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]] || return 1
+
+    u3_run_guard "$fixture" "$fixture/Library/Caches/foo-updater"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]]
+}
+
+@test "live cache guard parses JSON-form and @scope updater names" {
+    local fixture="$TEST_DIR/u3-updater-json"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    printf '{\r\n  "provider": "generic",\r\n  "updaterCacheDirName": "@foo-updater"\r\n}\r\n' \
+        > "$fixture/Applications/Foo.app/Contents/Resources/app-update.yml"
+    mkdir -p "$fixture/Library/Caches/@foo-updater"
+    u3_run_guard "$fixture" "$fixture/Library/Caches/@foo-updater" \
+        "$fixture/Applications/Foo.app/Contents/MacOS/Foo"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard keeps a pending newer electron update" {
+    local fixture="$TEST_DIR/u3-updater-pending"
+    local cache="$fixture/Library/Caches/foo-updater"
+    staged_update_make_bundle "$fixture/Applications/Foo.app" com.foo 1.0 100
+    printf 'updaterCacheDirName: foo-updater\n' \
+        > "$fixture/Applications/Foo.app/Contents/Resources/app-update.yml"
+
+    staged_update_make_bundle "$fixture/stage-new/Foo.app" com.foo 2.0 200
+    staged_update_make_pending_zip "$cache" "$fixture/stage-new" Foo.app
+    u3_run_guard "$fixture" "$cache"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]] || return 1
+
+    rm -rf "$cache"
+    staged_update_make_bundle "$fixture/stage-equal/Foo.app" com.foo 1.0 100
+    staged_update_make_pending_zip "$cache" "$fixture/stage-equal" Foo.app
+    u3_run_guard "$fixture" "$cache"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]] || return 1
+
+    rm -rf "$cache"
+    staged_update_make_bundle "$fixture/stage-two/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$fixture/stage-two/Bar.app" com.foo 1.0 100
+    staged_update_make_pending_zip "$cache" "$fixture/stage-two" Foo.app Bar.app
+    u3_run_guard "$fixture" "$cache"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard keeps an owner-unknown updater cache that has pending/" {
+    local fixture="$TEST_DIR/u3-updater-orphan-pending"
+    mkdir -p "$fixture/Library/Caches/orphan-updater/pending"
+    printf 'zip\n' > "$fixture/Library/Caches/orphan-updater/pending/Orphan.zip"
+    u3_run_guard "$fixture" "$fixture/Library/Caches/orphan-updater"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]]
+}
+
+@test "live cache guard keeps today's behaviour for an owner-unknown updater cache without pending/" {
+    local fixture="$TEST_DIR/u3-updater-orphan"
+    mkdir -p "$fixture/Library/Caches/orphan-updater"
+    printf 'zip\n' > "$fixture/Library/Caches/orphan-updater/update.zip"
+    u3_run_guard "$fixture" "$fixture/Library/Caches/orphan-updater"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]]
+}
+
+# Uninstall queues <id>.ShipIt and <name>-updater as leftovers of the app it
+# just removed. With the app gone, the clean sweep's "no installed owner"
+# verdict is unknown and keeps them; uninstall must still remove them.
+@test "live cache guard lets uninstall remove a removed app's staged ShipIt update" {
+    local fixture="$TEST_DIR/u3-uninstall-shipit"
+    staged_update_make_bundle "$fixture/Library/Caches/com.foo.ShipIt/update.ABC/Foo.app" com.foo 1.1 110
+    u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]] || { echo "$output"; return 1; }
+
+    U3_UNINSTALL_MODE=1 u3_run_guard "$fixture" "$fixture/Library/Caches/com.foo.ShipIt"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "live cache guard lets uninstall remove a removed app's updater pending/" {
+    local fixture="$TEST_DIR/u3-uninstall-updater"
+    mkdir -p "$fixture/Library/Caches/foo-updater/pending"
+    printf 'zip\n' > "$fixture/Library/Caches/foo-updater/pending/Foo.zip"
+    u3_run_guard "$fixture" "$fixture/Library/Caches/foo-updater"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]] || { echo "$output"; return 1; }
+
+    U3_UNINSTALL_MODE=1 u3_run_guard "$fixture" "$fixture/Library/Caches/foo-updater"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "mole_dotted_version_is_older compares numerically and keeps unknown apart" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+check() {
+    local rc=0 fusion_rc=0
+    mole_dotted_version_is_older "$1" "$2" || rc=$?
+    _autodesk_fusion_version_is_older "$1" "$2" || fusion_rc=$?
+    printf '%s<%s=%s ' "$1" "$2" "$rc"
+    [[ $rc -eq $fusion_rc ]] || printf 'FUSION_DIFFERS '
+}
+check 1.2 1.10
+check 1.10 1.2
+check 1.2 1.2.0
+check 01.2 1.2
+check 1.09 1.10
+check 1.2 1.2.1
+check 1.0 1.0000000000
+check 1.0000000000 2
+check 1.0a 2
+check "" 1
+printf '\n'
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"FUSION_DIFFERS"* ]] || return 1
+    [[ "$output" == *"1.2<1.10=0 "* ]] || return 1
+    [[ "$output" == *"1.10<1.2=1 "* ]] || return 1
+    [[ "$output" == *"1.2<1.2.0=1 "* ]] || return 1
+    [[ "$output" == *"01.2<1.2=1 "* ]] || return 1
+    [[ "$output" == *"1.09<1.10=0 "* ]] || return 1
+    [[ "$output" == *"1.2<1.2.1=0 "* ]] || return 1
+    [[ "$output" == *"1.0<1.0000000000=2 "* ]] || return 1
+    [[ "$output" == *"1.0000000000<2=2 "* ]] || return 1
+    [[ "$output" == *"1.0a<2=2 "* ]] || return 1
+    [[ "$output" == *"<1=2 "* ]]
+}
+
+# ----------------------------------------------------------------------------
+# Dot-less Chromium product caches with an exact owner map
+# ----------------------------------------------------------------------------
+
+@test "dot-less Tabbit cache kept while Tabbit runs" {
+    local fixture="$TEST_DIR/u5-tabbit"
+    mkdir -p "$fixture/Library/Caches/Tabbit/Default/Cache"
+    printf 'c\n' > "$fixture/Library/Caches/Tabbit/Default/Cache/data_0"
+
+    u3_run_guard "$fixture" "$fixture/Library/Caches/Tabbit" \
+        "/Applications/Tabbit.app/Contents/MacOS/Tabbit"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]] || { echo "$output"; return 1; }
+
+    u3_run_guard "$fixture" "$fixture/Library/Caches/Tabbit/Default/Cache/data_0" \
+        "/Applications/Tabbit.app/Contents/Frameworks/Tabbit Helper (Renderer).app/Contents/MacOS/Tabbit Helper (Renderer)"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0 VALID=1"* ]] || { echo "$output"; return 1; }
+
+    u3_run_guard "$fixture" "$fixture/Library/Caches/Tabbit"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]]
+}
+
+@test "dot-less cache owner map is exact: an unmapped name keeps today's behaviour" {
+    local fixture="$TEST_DIR/u5-unmapped"
+    mkdir -p "$fixture/Library/Caches/TabbitBeta" "$fixture/Library/Caches/tabbit"
+
+    u3_run_guard "$fixture" "$fixture/Library/Caches/TabbitBeta" \
+        "/Applications/Tabbit.app/Contents/MacOS/Tabbit"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]] || { echo "$output"; return 1; }
+
+    u3_run_guard "$fixture" "$fixture/Library/Caches/tabbit" \
+        "/Applications/Tabbit.app/Contents/MacOS/Tabbit"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=1 VALID=0"* ]]
+}
+
+# The sink must not trust the run's memoized process table: Tabbit started
+# after Mole first read ps still keeps its cache.
+@test "dot-less Tabbit cache kept when Tabbit starts after the memoized table" {
+    local fixture="$TEST_DIR/u5-tabbit-late"
+    mkdir -p "$fixture/Library/Caches/Tabbit"
+    run env HOME="$fixture" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        target="$fixture/Library/Caches/Tabbit" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+tabbit_running=false
+ps() {
+    [[ "$*" == *args* ]] || return 0
+    printf '  PID  PPID COMM ARGS\n'
+    printf '  900     1 /usr/sbin/cfprefsd /usr/sbin/cfprefsd agent\n'
+    [[ "$tabbit_running" != "true" ]] ||
+        printf '  901     1 Tabbit /Applications/Tabbit.app/Contents/MacOS/Tabbit\n'
+}
+_mole_load_process_table
+tabbit_running=true
+state=0
+_mole_should_refuse_live_user_cache_path "$target" || state=$?
+printf 'GUARD=%s\n' "$state"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0"* ]]
+}
+
+@test "dot-less Tabbit cache kept when the process table is unreadable" {
+    local fixture="$TEST_DIR/u5-tabbit-unknown"
+    mkdir -p "$fixture/Library/Caches/Tabbit"
+    run env HOME="$fixture" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        target="$fixture/Library/Caches/Tabbit" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+ps() { return 1; }
+state=0
+_mole_should_refuse_live_user_cache_path "$target" || state=$?
+printf 'GUARD=%s\n' "$state"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD=0"* ]]
 }

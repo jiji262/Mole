@@ -1,6 +1,8 @@
 #!/usr/bin/env bats
 
 load helpers/common
+load helpers/staged_updates
+load helpers/fork_caches
 
 setup_file() {
     mole_test_setup_home app-caches
@@ -439,7 +441,7 @@ for group in clean_communication_apps clean_dingtalk clean_ai_apps clean_design_
     clean_video_players clean_download_managers clean_gaming_platforms \
     clean_translation_apps clean_screenshot_tools clean_email_clients clean_task_apps \
     clean_shell_utils clean_system_utils clean_note_apps clean_launcher_apps \
-    clean_remote_desktop; do
+    clean_remote_desktop clean_superseded_staged_app_updates; do
     eval "$group() { echo GROUP; }"
 done
 clean_user_gui_applications
@@ -453,8 +455,8 @@ EOF
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     local first_run
     first_run=$(printf '%s\n' "$output" | sed -n '1,/^RC=/p' | tr '\n' ' ')
-    # Twenty groups, each one preceded by its own spinner start, then one stop.
-    [ "$(printf '%s\n' "$output" | sed -n '1,/^RC=/p' | grep -c '^START$')" -eq 20 ] || { echo "$first_run"; return 1; }
+    # Twenty-one groups, each one preceded by its own spinner start, then one stop.
+    [ "$(printf '%s\n' "$output" | sed -n '1,/^RC=/p' | grep -c '^START$')" -eq 21 ] || { echo "$first_run"; return 1; }
     [[ "$first_run" != *"GROUP GROUP"* ]] || { echo "$first_run"; return 1; }
     [[ "$first_run" == *"GROUP STOP RC=0"* ]] || { echo "$first_run"; return 1; }
     # A cancelled download-manager group still stops the spinner and returns its status.
@@ -3019,4 +3021,686 @@ grep -qxF "$cache/recognize" "$HOME/candidates" || exit 1
 if grep -E 'High Quality Media|Proxy Media|prerender|RemuxCache|MotionBlurCache|segmentPrerenderCache|Spotify|com.spotify.client' "$HOME/candidates"; then exit 1; fi
 SH
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+# Application Support/Quark/updates fixture: the installed Quark.app under
+# ~/Applications, a staged copy with the given versions backdated past
+# MOLE_TEMP_FILE_AGE_DAYS, and the DMG scaffolding plus account data around it.
+make_staged_quark_fixture() {
+    local fixture="$1" short="$2" build="$3"
+    local support="$fixture/Library/Application Support/Quark"
+    local staged="$support/updates/Quark.app"
+    mkdir -p "$fixture/SystemApplications" "$support/updates/.background" "$support/Cookies"
+    staged_update_make_bundle "$fixture/Applications/Quark.app" com.quark.desktop 7.3.5.1009 5.1009
+    staged_update_make_bundle "$staged" com.quark.desktop "$short" "$build"
+    printf 'installer\n' > "$support/updates/.install"
+    printf 'icon\n' > "$support/updates/.VolumeIcon.icns"
+    printf 'bg\n' > "$support/updates/.background/bg.png"
+    printf 'cookie\n' > "$support/Cookies/session"
+    touch -t 202001010000 "$staged/Contents/MacOS" "$staged/Contents/Resources" \
+        "$staged/Contents" "$staged"
+}
+
+# Run the staged-update cleaner through the real safe_clean_guarded funnel.
+# $2, when set, is an executable shown as running in the scripted ps table.
+# $3, when set, is a command run once, inside the delete guard and before
+# its own checks: a change after the scan and before the delete boundary.
+run_staged_app_update_clean() {
+    local fixture="$1" running="${2:-}" sink_mutation="${3:-}"
+    run env HOME="$fixture" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 MOLE_TEST_NO_AUTH=1 \
+        MOLE_TEST_APPLICATIONS_DIR="$fixture/SystemApplications" RUNNING="$running" \
+        SINK_MUTATION="$sink_mutation" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+mole_defer_cleanup_family() { printf 'DEFER|%s\n' "$1"; }
+ps() {
+    [[ "$*" == *args* ]] || return 0
+    printf '  PID  PPID COMM ARGS\n'
+    printf '  900     1 /usr/sbin/cfprefsd /usr/sbin/cfprefsd agent\n'
+    [[ -z "$RUNNING" ]] || printf '  901     1 %s %s\n' "$RUNNING" "$RUNNING"
+}
+if [[ -n "$SINK_MUTATION" ]]; then
+    eval "_staged_test_orig_guard() $(declare -f _staged_app_update_delete_guard | tail -n +2)"
+    _staged_app_update_delete_guard() {
+        if [[ -n "$SINK_MUTATION" ]]; then
+            eval "$SINK_MUTATION"
+            SINK_MUTATION=""
+        fi
+        _staged_test_orig_guard "$@"
+    }
+fi
+rc=0
+clean_superseded_staged_app_updates || rc=$?
+printf 'RC=%s\n' "$rc"
+EOF
+}
+
+@test "clean_superseded_staged_app_updates removes an equal-version staged Quark.app" {
+    local fixture="$HOME/staged-quark-equal"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    run_staged_app_update_clean "$fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"Quark staged update"* ]] || { echo "$output"; return 1; }
+    [[ ! -e "$staged" ]] || return 1
+    [[ -f "$fixture/Applications/Quark.app/Contents/Info.plist" ]]
+}
+
+@test "clean_superseded_staged_app_updates never touches updates/.background or sibling dirs" {
+    local fixture="$HOME/staged-quark-siblings"
+    local support="$fixture/Library/Application Support/Quark"
+    make_staged_quark_fixture "$fixture" 7.3.4.900 5.900
+    run_staged_app_update_clean "$fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ ! -e "$support/updates/Quark.app" ]] || { echo "$output"; return 1; }
+    [[ -d "$support/updates" ]] || return 1
+    [[ -f "$support/updates/.install" ]] || return 1
+    [[ -f "$support/updates/.VolumeIcon.icns" ]] || return 1
+    [[ -f "$support/updates/.background/bg.png" ]] || return 1
+    [[ -f "$support/Cookies/session" ]]
+}
+
+@test "clean_superseded_staged_app_updates keeps a newer staged bundle" {
+    local fixture="$HOME/staged-quark-newer"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.6.1100 5.1100
+    run_staged_app_update_clean "$fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"Quark staged update"* ]] || { echo "$output"; return 1; }
+    [[ -f "$staged/Contents/Info.plist" ]]
+}
+
+@test "clean_superseded_staged_app_updates keeps while Quark runs" {
+    local fixture="$HOME/staged-quark-running"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    run_staged_app_update_clean "$fixture" "$fixture/Applications/Quark.app/Contents/MacOS/Quark"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER|Quark"* ]] || { echo "$output"; return 1; }
+    [[ -f "$staged/Contents/Info.plist" ]]
+}
+
+@test "clean_superseded_staged_app_updates keeps when updates/ is a symlink" {
+    local fixture="$HOME/staged-quark-symlink"
+    local support="$fixture/Library/Application Support/Quark"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    mv "$support/updates" "$fixture/elsewhere-updates"
+    ln -s "$fixture/elsewhere-updates" "$support/updates"
+    run_staged_app_update_clean "$fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"Quark staged update"* ]] || { echo "$output"; return 1; }
+    [[ -f "$fixture/elsewhere-updates/Quark.app/Contents/Info.plist" ]]
+}
+
+@test "clean_superseded_staged_app_updates keeps a recently written staged bundle" {
+    local fixture="$HOME/staged-quark-recent"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    touch "$staged/Contents"
+    run_staged_app_update_clean "$fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"Quark staged update"* ]] || { echo "$output"; return 1; }
+    [[ -f "$staged/Contents/Info.plist" ]]
+}
+
+@test "clean_superseded_staged_app_updates keeps when the installed copies disagree" {
+    local fixture="$HOME/staged-quark-copies"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    staged_update_make_bundle "$fixture/SystemApplications/Quark.app" com.quark.desktop 7.3.6.1100 5.1100
+    run_staged_app_update_clean "$fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"Quark staged update"* ]] || { echo "$output"; return 1; }
+    [[ -f "$staged/Contents/Info.plist" ]]
+}
+
+# Each sink case changes one fact after the scan accepted the bundle; the
+# delete guard must re-read it and keep the bundle.
+@test "clean_superseded_staged_app_updates keeps a bundle that turns newer before the sink" {
+    local fixture="$HOME/staged-quark-sink-newer"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    # shellcheck disable=SC2016 # Evaluated by the child shell.
+    run_staged_app_update_clean "$fixture" "" '
+staged="$HOME/Library/Application Support/Quark/updates/Quark.app"
+plutil -replace CFBundleShortVersionString -string 7.3.6.1100 "$staged/Contents/Info.plist"
+plutil -replace CFBundleVersion -string 5.1100 "$staged/Contents/Info.plist"
+touch -t 202001010000 "$staged/Contents"'
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"DEFER|"* ]] || { echo "$output"; return 1; }
+    [[ -f "$staged/Contents/Info.plist" ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_superseded_staged_app_updates keeps a bundle written to before the sink" {
+    local fixture="$HOME/staged-quark-sink-fresh"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    # shellcheck disable=SC2016 # Evaluated by the child shell.
+    run_staged_app_update_clean "$fixture" "" \
+        'touch "$HOME/Library/Application Support/Quark/updates/Quark.app/Contents"'
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ -f "$staged/Contents/Info.plist" ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_superseded_staged_app_updates keeps a bundle whose updates/ turns into a symlink before the sink" {
+    local fixture="$HOME/staged-quark-sink-symlink"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    # shellcheck disable=SC2016 # Evaluated by the child shell.
+    run_staged_app_update_clean "$fixture" "" '
+support="$HOME/Library/Application Support/Quark"
+mv "$support/updates" "$HOME/elsewhere-updates"
+ln -s "$HOME/elsewhere-updates" "$support/updates"'
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    [[ -f "$fixture/elsewhere-updates/Quark.app/Contents/Info.plist" ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_superseded_staged_app_updates dry-run previews without removing" {
+    local fixture="$HOME/staged-quark-dry"
+    local staged="$fixture/Library/Application Support/Quark/updates/Quark.app"
+    make_staged_quark_fixture "$fixture" 7.3.5.1009 5.1009
+    run env HOME="$fixture" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 MOLE_TEST_NO_AUTH=1 \
+        MOLE_TEST_APPLICATIONS_DIR="$fixture/SystemApplications" \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=true
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+register_dry_run_cleanup_target() { return 0; }
+append_dry_run_cleanup_target() { printf 'DRY|%s\n' "$1"; }
+ps() {
+    [[ "$*" == *args* ]] || return 0
+    printf '  PID  PPID COMM ARGS\n'
+    printf '  900     1 /usr/sbin/cfprefsd /usr/sbin/cfprefsd agent\n'
+}
+clean_superseded_staged_app_updates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DRY|$staged"* ]] || { echo "$output"; return 1; }
+    [[ -f "$staged/Contents/Info.plist" ]]
+}
+
+# ----------------------------------------------------------------------------
+# Chromium-fork cache leaves (Tabbit, Comet, Douzy) behind one owner probe
+# ----------------------------------------------------------------------------
+
+# Comet root with cache leaves and the profile data that must survive.
+comet_fixture() {
+    local root="$1/Library/Application Support/Comet"
+    mkdir -p "$root/component_crx_cache" "$root/Default/GPUCache" \
+        "$root/Profile 1/Code Cache" "$root/Profile Foo/Cache" \
+        "$root/WidevineCdm" "$root/Safe Browsing" "$root/BrowserMetrics" \
+        "$root/Default/Shared Dictionary/cache" "$root/Default/Extensions/ext" \
+        "$root/Default/Service Worker/CacheStorage/origin/cache" \
+        "$root/Default/Service Worker/Database"
+    printf 'x\n' > "$root/component_crx_cache/x"
+    printf 'y\n' > "$root/Default/GPUCache/y"
+    printf 'c\n' > "$root/Profile 1/Code Cache/c"
+    printf 'k\n' > "$root/Profile Foo/Cache/k"
+    printf 'd\n' > "$root/Default/Shared Dictionary/cache/d"
+    printf 'm\n' > "$root/BrowserMetrics/BrowserMetrics-1.pma"
+    printf 'n\n' > "$root/BrowserMetrics/notes.txt"
+    printf 'w\n' > "$root/Default/Service Worker/CacheStorage/origin/cache/w"
+    printf 'db\n' > "$root/Default/Service Worker/Database/db"
+    printf 'cookies\n' > "$root/Default/Cookies"
+    printf 'e\n' > "$root/Default/Extensions/ext/manifest.json"
+    printf 'z\n' > "$root/WidevineCdm/z"
+    printf 's\n' > "$root/Safe Browsing/s"
+    printf '{}\n' > "$root/Local State"
+}
+
+@test "fork chromium leaves are cleaned for Comet when idle" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    comet_fixture "$case_home"
+    root="$case_home/Library/Application Support/Comet"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$root/component_crx_cache/x" ] || { echo "$output"; return 1; }
+    [ ! -e "$root/Default/GPUCache/y" ] || return 1
+    [ ! -e "$root/Profile 1/Code Cache/c" ] || return 1
+    [ ! -e "$root/Default/Shared Dictionary/cache/d" ] || return 1
+    [ ! -e "$root/BrowserMetrics/BrowserMetrics-1.pma" ] || return 1
+    [ ! -e "$root/Default/Service Worker/CacheStorage/origin/cache" ] || return 1
+    # Leaf directories stay; only their children go.
+    [ -d "$root/Default/GPUCache" ] || return 1
+    [ -f "$root/BrowserMetrics/notes.txt" ] || return 1
+    [ -f "$root/Profile Foo/Cache/k" ] || return 1
+    [ -f "$root/Default/Cookies" ] || return 1
+    [ -f "$root/Default/Extensions/ext/manifest.json" ] || return 1
+    [ -f "$root/Default/Service Worker/Database/db" ] || return 1
+    [ -f "$root/WidevineCdm/z" ] || return 1
+    [ -f "$root/Safe Browsing/s" ] || return 1
+    [ -f "$root/Local State" ]
+}
+
+@test "fork chromium leaves are deferred while Comet runs" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    comet_fixture "$case_home"
+    root="$case_home/Library/Application Support/Comet"
+    printf '%s\n' "/Applications/Comet.app/Contents/MacOS/Comet" > "$case_home/ps-busy"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$root/Default/GPUCache/y" ] || { echo "$output"; return 1; }
+    [ -f "$root/component_crx_cache/x" ] || return 1
+    [ -f "$root/Default/Service Worker/CacheStorage/origin/cache/w" ] || return 1
+    [[ "$output" == *"DEFER=Comet"* ]]
+}
+
+@test "fork chromium leaves are kept when the Comet process state is unknown" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    comet_fixture "$case_home"
+    root="$case_home/Library/Application Support/Comet"
+    touch "$case_home/ps-error"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$root/Default/GPUCache/y" ] || { echo "$output"; return 1; }
+    [ -f "$root/component_crx_cache/x" ] || return 1
+    [[ "$output" == *"Comet caches · stopped (process state unknown)"* ]]
+}
+
+@test "fork chromium leaves skip a symlinked Default profile" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    root="$case_home/Library/Application Support/Comet"
+    mkdir -p "$root" "$case_home/elsewhere/GPUCache"
+    printf 'y\n' > "$case_home/elsewhere/GPUCache/y"
+    ln -s "$case_home/elsewhere" "$root/Default"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$case_home/elsewhere/GPUCache/y" ] || { echo "$output"; return 1; }
+    [[ "$output" != *"elsewhere"* ]]
+}
+
+@test "fork chromium leaves clean Douzy partitions but keep its account data" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    root="$case_home/Library/Application Support/Douzy"
+    mkdir -p "$root/Cache" "$root/Partitions/douyin-login/GPUCache" \
+        "$root/Partitions/douyin-login/Local Storage" "$root/Local Storage"
+    printf 'c\n' > "$root/Cache/c"
+    printf 'g\n' > "$root/Partitions/douyin-login/GPUCache/g"
+    printf 'l\n' > "$root/Partitions/douyin-login/Local Storage/l"
+    printf 'cookies\n' > "$root/Cookies"
+    printf 'lic\n' > "$root/license.bin"
+    printf 'db\n' > "$root/dy_downloader.db"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$root/Cache/c" ] || { echo "$output"; return 1; }
+    [ ! -e "$root/Partitions/douyin-login/GPUCache/g" ] || return 1
+    [ -f "$root/Partitions/douyin-login/Local Storage/l" ] || return 1
+    [ -f "$root/Cookies" ] || return 1
+    [ -f "$root/license.bin" ] || return 1
+    [ -f "$root/dy_downloader.db" ]
+}
+
+@test "fork chromium dry-run writes nothing and previews only eligible leaves" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    comet_fixture "$case_home"
+    root="$case_home/Library/Application Support/Comet"
+
+    MOLE_DRY_RUN=1 fork_caches_run "$case_home" clean_fork_app_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$root/Default/GPUCache/y" ] || { echo "$output"; return 1; }
+    [ -f "$root/component_crx_cache/x" ] || return 1
+    [ -f "$root/BrowserMetrics/BrowserMetrics-1.pma" ] || return 1
+    [ -f "$root/Default/Service Worker/CacheStorage/origin/cache/w" ] || return 1
+    [[ "$output" == *"Comet Default/GPUCache"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"Cookies"* ]] || return 1
+    [[ "$output" != *"WidevineCdm"* ]] || return 1
+    [[ "$output" != *"Profile Foo"* ]]
+}
+
+# ----------------------------------------------------------------------------
+# QQ (NT) sandboxed logs, QQ docs caches and the installed-version archive
+# ----------------------------------------------------------------------------
+
+QQ_TEST_HEX="5feb0c9623e92cc0ac75d1ff93f338a9"
+
+qq_root() {
+    printf '%s\n' "$1/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"
+}
+
+qq_log_fixture() {
+    local q
+    q=$(qq_root "$1")
+    mkdir -p "$q/nt_qq_$QQ_TEST_HEX/nt_data/log" "$q/nt_qq_$QQ_TEST_HEX/nt_db" \
+        "$q/log" "$q/global/nt_data/Log/log"
+    printf 'log\n' > "$q/nt_qq_$QQ_TEST_HEX/nt_data/log/a.qqxlog"
+    printf 'db\n' > "$q/nt_qq_$QQ_TEST_HEX/nt_db/x.db"
+    printf 'log\n' > "$q/log/updater.log"
+    printf 'log\n' > "$q/global/nt_data/Log/log/prelogin.qqxlog"
+    printf 'cookies\n' > "$q/Cookies"
+}
+
+# versions/<cur>/QQUpdate.app plus versions/<zip_version>.zip aged 30 days.
+qq_versions_fixture() {
+    local case_home="$1" cur="$2" ready="$3" zip_version="$4"
+    local versions
+    versions="$(qq_root "$case_home")/versions"
+    mkdir -p "$versions/$zip_version/QQUpdate.app/Contents/MacOS"
+    printf '{\n  "readyVersion": "%s",\n  "curVersion": "%s"\n}\n' "$ready" "$cur" \
+        > "$versions/config.json"
+    printf 'zip\n' > "$versions/$zip_version.zip"
+    fork_caches_age_tree "$versions/$zip_version.zip"
+}
+
+@test "QQ logs are cleaned only when QQ is idle" {
+    local case_home q
+    case_home=$(fork_caches_case_home)
+    qq_log_fixture "$case_home"
+    q=$(qq_root "$case_home")
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$q/nt_qq_$QQ_TEST_HEX/nt_data/log/a.qqxlog" ] || { echo "$output"; return 1; }
+    [ ! -e "$q/log/updater.log" ] || return 1
+    [ ! -e "$q/global/nt_data/Log/log/prelogin.qqxlog" ] || return 1
+    [ -d "$q/nt_qq_$QQ_TEST_HEX/nt_data/log" ] || return 1
+    [ -f "$q/nt_qq_$QQ_TEST_HEX/nt_db/x.db" ] || return 1
+    [ -f "$q/Cookies" ]
+}
+
+@test "QQ logs are kept while QQ runs" {
+    local case_home q
+    case_home=$(fork_caches_case_home)
+    qq_log_fixture "$case_home"
+    q=$(qq_root "$case_home")
+    printf '%s\n' "/Applications/QQ.app/Contents/MacOS/QQ" > "$case_home/ps-busy"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$q/nt_qq_$QQ_TEST_HEX/nt_data/log/a.qqxlog" ] || { echo "$output"; return 1; }
+    [ -f "$q/log/updater.log" ] || return 1
+    [[ "$output" == *"DEFER=QQ"* ]]
+}
+
+@test "QQ logs are kept when the QQ process state is unknown" {
+    local case_home q
+    case_home=$(fork_caches_case_home)
+    qq_log_fixture "$case_home"
+    q=$(qq_root "$case_home")
+    touch "$case_home/ps-error"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$q/nt_qq_$QQ_TEST_HEX/nt_data/log/a.qqxlog" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"QQ container caches · stopped (process state unknown)"* ]]
+}
+
+@test "QQ nt_qq dir with a non-hex suffix is ignored" {
+    local case_home q
+    case_home=$(fork_caches_case_home)
+    q=$(qq_root "$case_home")
+    mkdir -p "$q/nt_qq_backup-copy/nt_data/log" "$q/nt_qq_${QQ_TEST_HEX}0/nt_data/log"
+    printf 'log\n' > "$q/nt_qq_backup-copy/nt_data/log/a.qqxlog"
+    printf 'log\n' > "$q/nt_qq_${QQ_TEST_HEX}0/nt_data/log/a.qqxlog"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$q/nt_qq_backup-copy/nt_data/log/a.qqxlog" ] || { echo "$output"; return 1; }
+    [ -f "$q/nt_qq_${QQ_TEST_HEX}0/nt_data/log/a.qqxlog" ]
+}
+
+@test "QQ docs caches are cleaned per numeric user and deferred while QQEXDOC runs" {
+    local case_home users
+    case_home=$(fork_caches_case_home)
+    users="$case_home/Library/Containers/com.tencent.qqexdoc/Data/Library/Application Support/QQEX/users"
+    mkdir -p "$users/144115/Cache" "$users/144115/Code Cache" "$users/144115/Local Storage" \
+        "$users/144115/Service Worker/CacheStorage/origin/cache" "$users/abc/Cache"
+    printf 'c\n' > "$users/144115/Cache/c"
+    printf 'k\n' > "$users/144115/Code Cache/k"
+    printf 'l\n' > "$users/144115/Local Storage/l"
+    printf 'w\n' > "$users/144115/Service Worker/CacheStorage/origin/cache/w"
+    printf 'a\n' > "$users/abc/Cache/a"
+    printf '%s\n' "/Users/x/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/versions/1.0-1/QQUpdate.app/Contents/MacOS/QQEXDOC.app/Contents/MacOS/QQEXDOC" \
+        > "$case_home/ps-busy"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$users/144115/Cache/c" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER=QQ"* ]] || return 1
+
+    rm -f "$case_home/ps-busy"
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$users/144115/Cache/c" ] || { echo "$output"; return 1; }
+    [ ! -e "$users/144115/Code Cache/k" ] || return 1
+    [ ! -e "$users/144115/Service Worker/CacheStorage/origin/cache" ] || return 1
+    [ -f "$users/144115/Local Storage/l" ] || return 1
+    [ -f "$users/abc/Cache/a" ]
+}
+
+@test "QQ versions zip of the current unpacked version is removed" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "" "1.0-1"
+    versions="$(qq_root "$case_home")/versions"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+    [ -d "$versions/1.0-1/QQUpdate.app/Contents" ] || return 1
+    [ -f "$versions/config.json" ]
+}
+
+@test "QQ versions zip of a staged non-current version is kept" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "" "2.0-2"
+    versions="$(qq_root "$case_home")/versions"
+    mkdir -p "$versions/1.0-1/QQUpdate.app/Contents"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/2.0-2.zip" ] || { echo "$output"; return 1; }
+}
+
+@test "QQ versions zip is kept when config.json is missing" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "" "1.0-1"
+    versions="$(qq_root "$case_home")/versions"
+    rm -f "$versions/config.json"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+}
+
+@test "QQ versions zip is kept when readyVersion equals it" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "1.0-1" "1.0-1"
+    versions="$(qq_root "$case_home")/versions"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+}
+
+@test "QQ versions zip is kept when young or without an unpacked app" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "" "1.0-1"
+    versions="$(qq_root "$case_home")/versions"
+    touch "$versions/1.0-1.zip"
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+
+    fork_caches_age_tree "$versions/1.0-1.zip"
+    rm -rf "$versions/1.0-1/QQUpdate.app"
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+}
+
+# Hook mutations: replace versions/config.json with the staged config.next,
+# or show QQ as running.
+# shellcheck disable=SC2016 # Evaluated by the child shell.
+QQ_SWAP_CONFIG='cp "${1%/*}/config.next" "${1%/*}/config.json"'
+# shellcheck disable=SC2016 # Evaluated by the child shell.
+QQ_START_PROCESS='printf "%s\n" "/Applications/QQ.app/Contents/MacOS/QQ" > "$HOME/ps-busy"'
+
+# Prelude that runs <mutation> inside <guard> right before the original guard,
+# so the change lands after the scan and before the delete boundary.
+qq_sink_hook() {
+    local guard="$1" mutation="$2"
+    # shellcheck disable=SC2016 # Evaluated by the child shell.
+    printf 'eval "_qq_test_orig_guard() $(declare -f %s | tail -n +2)"\n%s() {\n%s\n_qq_test_orig_guard "$@"\n}\n' \
+        "$guard" "$guard" "$mutation"
+}
+
+@test "QQ versions zip is kept when QQ starts between the scan and the sink" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "" "1.0-1"
+    versions="$(qq_root "$case_home")/versions"
+
+    fork_caches_run "$case_home" clean_qq_container_caches "$(qq_sink_hook \
+        _qq_archive_delete_guard_allows "$QQ_START_PROCESS")"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER=QQ"* ]] || { echo "$output"; return 1; }
+}
+
+@test "QQ versions zip is kept when readyVersion becomes it before the sink" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "" "1.0-1"
+    versions="$(qq_root "$case_home")/versions"
+    printf '{"readyVersion": "1.0-1", "curVersion": "1.0-1"}\n' > "$versions/config.next"
+
+    fork_caches_run "$case_home" clean_qq_container_caches "$(qq_sink_hook \
+        _qq_archive_delete_guard_allows "$QQ_SWAP_CONFIG")"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+    [[ "$output" != *"DEFER=QQ"* ]] || { echo "$output"; return 1; }
+}
+
+@test "QQ versions zip is kept when curVersion moves before the sink" {
+    local case_home versions
+    case_home=$(fork_caches_case_home)
+    qq_versions_fixture "$case_home" "1.0-1" "" "1.0-1"
+    versions="$(qq_root "$case_home")/versions"
+    # A complete, aged 2.0-2 next to it, so the moved curVersion still
+    # yields an eligible archive, just not the one bound at the scan.
+    mkdir -p "$versions/2.0-2/QQ.app/Contents"
+    printf 'zip\n' > "$versions/2.0-2.zip"
+    fork_caches_age_tree "$versions/2.0-2.zip"
+    printf '{"readyVersion": "", "curVersion": "2.0-2"}\n' > "$versions/config.next"
+
+    fork_caches_run "$case_home" clean_qq_container_caches "$(qq_sink_hook \
+        _qq_archive_delete_guard_allows "$QQ_SWAP_CONFIG")"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$versions/1.0-1.zip" ] || { echo "$output"; return 1; }
+    [ -f "$versions/2.0-2.zip" ] || { echo "$output"; return 1; }
+}
+
+@test "QQ logs are kept when QQ starts between the scan and the sink" {
+    local case_home q
+    case_home=$(fork_caches_case_home)
+    qq_log_fixture "$case_home"
+    q=$(qq_root "$case_home")
+
+    fork_caches_run "$case_home" clean_qq_container_caches "$(qq_sink_hook \
+        _qq_container_delete_guard_allows "$QQ_START_PROCESS")"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$q/nt_qq_$QQ_TEST_HEX/nt_data/log/a.qqxlog" ] || { echo "$output"; return 1; }
+    [ -f "$q/log/updater.log" ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER=QQ"* ]] || { echo "$output"; return 1; }
+}
+
+@test "QQ Data/tmp is never touched" {
+    local case_home tmp_dir
+    case_home=$(fork_caches_case_home)
+    qq_log_fixture "$case_home"
+    tmp_dir="$case_home/Library/Containers/com.tencent.qq/Data/tmp"
+    mkdir -p "$tmp_dir"
+    printf 'png\n' > "$tmp_dir/0A1B2C3D.png"
+    fork_caches_age_tree "$tmp_dir" 60
+
+    fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$tmp_dir/0A1B2C3D.png" ] || { echo "$output"; return 1; }
+}
+
+@test "QQ dry-run writes nothing" {
+    local case_home q
+    case_home=$(fork_caches_case_home)
+    qq_log_fixture "$case_home"
+    qq_versions_fixture "$case_home" "1.0-1" "" "1.0-1"
+    q=$(qq_root "$case_home")
+
+    MOLE_DRY_RUN=1 fork_caches_run "$case_home" clean_qq_container_caches
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$q/nt_qq_$QQ_TEST_HEX/nt_data/log/a.qqxlog" ] || { echo "$output"; return 1; }
+    [ -f "$q/versions/1.0-1.zip" ] || return 1
+    [[ "$output" == *"QQ installed version archive"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"nt_db"* ]]
+}
+
+@test "clean_communication_apps runs the QQ container step after WeChat" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { :; }
+safe_clean_guarded() { :; }
+clean_feishu_service_worker_caches() { :; }
+clean_notion_service_worker_caches() { :; }
+clean_wechat_container_caches() { echo "WECHAT"; }
+clean_qq_container_caches() { echo "QQ"; }
+clean_communication_apps
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"WECHAT"*"QQ"* ]]
 }

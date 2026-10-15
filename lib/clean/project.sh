@@ -13,6 +13,9 @@ fi
 source "$PROJECT_LIB_DIR/purge_shared.sh"
 
 readonly PURGE_TARGETS=("${MOLE_PURGE_TARGETS[@]}")
+# Every directory name discovery reports: ordinary targets plus the names that
+# are only ever listed for review (never preselected).
+readonly PURGE_SCAN_NAMES=("${MOLE_PURGE_TARGETS[@]}" "${MOLE_PURGE_REVIEW_TARGETS[@]}")
 # Minimum age in days before considering for cleanup.
 readonly MIN_AGE_DAYS=7
 # Scan depth defaults (relative to search root).
@@ -63,9 +66,10 @@ is_project_container() {
     # up to date, and recovery needs a network restore, which purge must never
     # require (#1459). Same shape for vendor/ and Pods/. A container that
     # happens to share an artifact name stays reachable through
-    # ~/.config/mole/purge_paths, which bypasses discovery.
+    # ~/.config/mole/purge_paths, which bypasses discovery. Review-only names
+    # are artifacts too.
     local purge_target
-    for purge_target in "${PURGE_TARGETS[@]}"; do
+    for purge_target in "${PURGE_SCAN_NAMES[@]}"; do
         if [[ "$basename" == "$purge_target" ]]; then
             return 1
         fi
@@ -531,6 +535,65 @@ purge_artifact_has_authored_content() {
 # unfinished content probe rather than evidence.
 PURGE_PROTECTION_UNVERIFIED=false
 
+# The name venv proves nothing: conda envs, data folders and hand-made trees
+# use it too. Purge one only when it is a real virtualenv (a regular
+# pyvenv.cfg) beside a manifest in its own directory that can rebuild it.
+# A grandparent or monorepo manifest does not count, nor does a symlink.
+# Returns 0 to protect and 1 when both hold; any failed probe protects.
+is_unrebuildable_python_env() {
+    local path="${1%/}"
+    local deadline="${2:-}"
+    path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || return 0
+    [[ -f "$path/pyvenv.cfg" && ! -L "$path/pyvenv.cfg" ]] || return 0
+
+    local parent="${path%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    local manifest
+    for manifest in "${MOLE_PURGE_PYTHON_MANIFESTS[@]}"; do
+        [[ -f "$parent/$manifest" && ! -L "$parent/$manifest" ]] && return 1
+    done
+
+    local probe_timeout="" requirements=""
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" "$deadline") || return 0
+    # -type f without -L never counts a symlinked requirements file.
+    requirements=$(run_with_timeout "$probe_timeout" /usr/bin/find "$parent" -maxdepth 1 \
+        -type f -name 'requirements*.txt' -print -quit 2> /dev/null) || return 0
+    [[ -z "$requirements" ]]
+}
+
+is_purge_review_target() {
+    local name="$1" review_name
+    for review_name in "${MOLE_PURGE_REVIEW_TARGETS[@]}"; do
+        [[ "$name" == "$review_name" ]] && return 0
+    done
+    return 1
+}
+
+# Age-column label for a review-only row: why it is never preselected.
+purge_review_target_label() {
+    case "$1" in
+        .terraform) printf '%s\n' "review: may hold state" ;;
+        *) printf '%s\n' "review: may hold saved output" ;;
+    esac
+}
+
+# Inside a Git work tree a review-only directory is offered only when Git
+# ignores it: an unignored one is project content, not a disposable artifact.
+# Returns 0 to withhold the row, 1 to offer it. Outside Git it is offered,
+# still unselected. A failed or timed-out check withholds it.
+purge_review_artifact_withheld() {
+    local path="${1%/}"
+    local deadline="${2:-}"
+    path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || return 0
+    mole_find_git_repo_root "$path" || return 1
+
+    local ignore_rc=0
+    mole_git_check_ignore "$MOLE_GIT_REPO_ROOT" "$deadline" "$path" || ignore_rc=$?
+    [[ $ignore_rc -eq 0 ]] && return 1
+    debug_log "Withholding review-only artifact (git check-ignore status $ignore_rc): $path"
+    return 0
+}
+
 is_protected_purge_artifact() {
     local path="${1%/}"
     local deadline="${2:-}"
@@ -564,8 +627,16 @@ is_protected_purge_artifact() {
             [[ "$path" == *"/Library/Developer/Xcode/DerivedData"* ]] && return 0
             return 1
             ;;
+        venv | .venv)
+            is_unrebuildable_python_env "$path" "$deadline"
+            return $?
+            ;;
     esac
 
+    if is_purge_review_target "$base"; then
+        purge_review_artifact_withheld "$path" "$deadline"
+        return $?
+    fi
     return 1
 }
 
@@ -612,7 +683,7 @@ _purge_walk_expressions() {
     done
     [[ "$with_dataless" != "yes" ]] || _PURGE_PRUNE_EXPR+=(-o -flags +dataless)
     _PURGE_TARGET_EXPR=()
-    for name in "${PURGE_TARGETS[@]}"; do
+    for name in "${PURGE_SCAN_NAMES[@]}"; do
         [[ ${#_PURGE_TARGET_EXPR[@]} -eq 0 ]] || _PURGE_TARGET_EXPR+=(-o)
         _PURGE_TARGET_EXPR+=(-name "$name")
     done
@@ -825,7 +896,7 @@ scan_purge_targets() {
     elif command -v fd > /dev/null 2>&1; then
         # Escape regex special characters in target names for fd patterns (single sed pass)
         local _escaped_lines
-        _escaped_lines=$(printf '%s\n' "${PURGE_TARGETS[@]}" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
+        _escaped_lines=$(printf '%s\n' "${PURGE_SCAN_NAMES[@]}" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
         local pattern
         pattern="($(printf '%s\n' "$_escaped_lines" | sed -e 's/^/^/' -e 's/$/$/' | paste -sd '|' -))"
         local fd_args=(
@@ -858,7 +929,7 @@ scan_purge_targets() {
             "--exclude" "Applications"
         )
         local purge_target
-        for purge_target in "${PURGE_TARGETS[@]}"; do
+        for purge_target in "${PURGE_SCAN_NAMES[@]}"; do
             fd_tag_args+=("--exclude" "$purge_target")
         done
 
@@ -1249,18 +1320,151 @@ purge_target_activity_still_safe() {
     return 1
 }
 
+# Process snapshots for one menu build. A state of "" means none was taken
+# and each probe reads afresh; "ok" or "unavailable" reuse the snapshot.
+_PURGE_ARGV_SNAPSHOT=""
+_PURGE_ARGV_SNAPSHOT_STATE=""
+_PURGE_CWD_SNAPSHOT=""
+_PURGE_CWD_SNAPSHOT_STATE=""
+
+# Print the cwd of every process in lsof -FpRn output except Mole's own tree:
+# $1's ancestors (the shell that ran `mo purge`, often from inside a project)
+# and its descendants (this lsof and its timeout wrapper). Same policy as the
+# ps table filter in file_ops.sh, which also drops the invoking tree.
+_purge_filter_foreign_cwds() {
+    LC_ALL=C awk -v self="$1" '
+        /^p/ { pid = substr($0, 2); order[++count] = pid; next }
+        /^R/ { parent[pid] = substr($0, 2); next }
+        /^n/ { cwd[pid] = substr($0, 2); next }
+        END {
+            for (p = self; p != "" && p != "0" && p != "1" && !(p in mine); p = parent[p]) mine[p] = 1
+            for (i = 1; i <= count; i++) {
+                depth = 0
+                for (p = order[i]; p != "" && p != "0" && p != "1" && depth < 64; p = parent[p]) {
+                    if (p == self) { mine[order[i]] = 1; break }
+                    depth++
+                }
+            }
+            for (i = 1; i <= count; i++) {
+                pid = order[i]
+                if (!(pid in mine) && (pid in cwd)) print cwd[pid]
+            }
+        }'
+}
+
+# Print the working directories of the invoking user's processes, one per
+# line, without Mole's own process tree. User scope only: other users'
+# processes are invisible, so this can only narrow a selection. An lsof
+# failure, timeout or empty answer fails.
+_purge_read_process_cwds() {
+    local uid="" raw="" rc=0
+    uid=$(id -u 2> /dev/null) || return 1
+    raw=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        lsof -a -u "$uid" -d cwd -FpRn < /dev/null 2> /dev/null) || rc=$?
+    if [[ $rc -ne 0 || -z "$raw" ]]; then
+        debug_log "Purge cwd probe failed (status $rc); project use is unknown"
+        return 1
+    fi
+    printf '%s\n' "$raw" | _purge_filter_foreign_cwds "$$" || {
+        debug_log "Purge cwd filter failed; project use is unknown"
+        return 1
+    }
+}
+
+# Take one ps and one lsof snapshot for every row of the menu being built.
+purge_take_process_snapshot() {
+    _PURGE_ARGV_SNAPSHOT_STATE="unavailable"
+    _PURGE_CWD_SNAPSHOT_STATE="unavailable"
+    if _mole_read_process_table && [[ -n "$_MOLE_PROCESS_TABLE_READ" ]]; then
+        _PURGE_ARGV_SNAPSHOT="$_MOLE_PROCESS_TABLE_READ"
+        _PURGE_ARGV_SNAPSHOT_STATE="ok"
+    else
+        debug_log "Purge process table unavailable; project use is unknown"
+    fi
+    if _PURGE_CWD_SNAPSHOT=$(_purge_read_process_cwds); then
+        _PURGE_CWD_SNAPSHOT_STATE="ok"
+    fi
+}
+
+_purge_project_argv_state() {
+    local root="$1"
+    case "$_PURGE_ARGV_SNAPSHOT_STATE" in
+        ok) mole_process_table_references_paths "$_PURGE_ARGV_SNAPSHOT" "$root" ;;
+        "") mole_process_args_reference_paths --fresh "$root" ;;
+        *) return 2 ;;
+    esac
+}
+
+# Literal match: the cwd is the project root or lies below it.
+_purge_project_cwd_state() {
+    local physical_root="$1" cwds="" cwd
+    case "$_PURGE_CWD_SNAPSHOT_STATE" in
+        ok) cwds="$_PURGE_CWD_SNAPSHOT" ;;
+        "") cwds=$(_purge_read_process_cwds) || return 2 ;;
+        *) return 2 ;;
+    esac
+    while IFS= read -r cwd; do
+        [[ "$cwd" == "$physical_root" || "$cwd" == "$physical_root/"* ]] && return 0
+    done <<< "$cwds"
+    return 1
+}
+
+# Tri-state: 0 a process names the project in its argv or works inside it,
+# 1 neither probe found one, 2 could not tell. Translate through
+# mole_clean_process_guard; never fold 2 into "idle".
+purge_project_process_state() {
+    local root="${1%/}" physical_root="" argv_rc=0 cwd_rc=0
+    physical_root=$(cd "$root" 2> /dev/null && /bin/pwd -P) || return 2
+    [[ "$physical_root" != "/" ]] || return 2
+    _purge_project_argv_state "$root" || argv_rc=$?
+    [[ $argv_rc -eq 0 ]] && return 0
+    _purge_project_cwd_state "$physical_root" || cwd_rc=$?
+    [[ $cwd_rc -eq 0 ]] && return 0
+    [[ $argv_rc -eq 1 && $cwd_rc -eq 1 ]] && return 1
+    return 2
+}
+
+_PURGE_PROCESS_PROBE_ROOT=""
+# shellcheck disable=SC2329 # Called by name through mole_clean_process_guard.
+_purge_project_process_probe() {
+    purge_project_process_state "$_PURGE_PROCESS_PROBE_ROOT"
+}
+
+# The project an artifact belongs to: the indicator-backed root, else the
+# artifact's direct parent, the narrowest boundary provable without one.
+purge_artifact_project_root() {
+    local path="$1"
+    find_purge_project_root_for_artifact "$path" || printf '%s\n' "${path%/*}"
+}
+
+# Sink-side process check. Probes afresh: the menu snapshot can be minutes old
+# by the time the user confirms. Sets _MOLE_PURGE_FINAL_GUARD_REASON on refusal.
+purge_artifact_project_idle() {
+    local path="$1"
+    local _PURGE_ARGV_SNAPSHOT_STATE="" _PURGE_CWD_SNAPSHOT_STATE=""
+    local _PURGE_PROCESS_PROBE_ROOT=""
+    _PURGE_PROCESS_PROBE_ROOT=$(purge_artifact_project_root "$path")
+    mole_clean_process_guard _purge_project_process_probe \
+        "process running in project" "could not check processes in project" && return 0
+    _MOLE_PURGE_FINAL_GUARD_REASON="$_MOLE_CLEAN_GUARD_REASON"
+    return 1
+}
+
 # Final safe_remove hook for purge. The caller supplies the exact scan-root and
 # candidate identities through dynamically scoped locals. Recheck them after
 # the stateful activity probe so no filesystem walk separates identity proof
 # from safe_remove's deletion sink.
+_MOLE_PURGE_FINAL_GUARD_REASON=""
 _mole_purge_final_remove_guard() {
     local path="$1"
+    _MOLE_PURGE_FINAL_GUARD_REASON=""
     is_safe_configured_purge_artifact "$path" || return 1
     local protection_rc=0
     is_protected_purge_artifact "$path" || protection_rc=$?
     [[ $protection_rc -le 128 ]] || return "$protection_rc"
     [[ $protection_rc -ne 0 ]] || return 1
     purge_target_activity_still_safe "$path" "${_MOLE_PURGE_FINAL_ACTIVITY_STATE:-uncertain}" || return $?
+    purge_artifact_project_idle "$path" || return 1
 
     _mole_path_matches_identity \
         "${_MOLE_PURGE_FINAL_SCAN_ROOT:-}" \
@@ -1424,6 +1628,28 @@ format_purge_display() {
     fi
     local padding=$((path_width - $(get_display_width "$path")))
     printf '%s%*s %9s | %s' "$path" "$padding" "" "$size" "$(truncate_by_display_width "$artifact" "$artifact_width")"
+}
+
+# Name the rows a non-interactive run left unselected because they need a
+# person. Args: in-use row count, then one "path (label)" per review-only row.
+report_held_purge_rows() {
+    local in_use_count="$1"
+    shift
+    if [[ $in_use_count -gt 0 ]]; then
+        local in_use_text="artifact"
+        [[ $in_use_count -ne 1 ]] && in_use_text="artifacts"
+        echo ""
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Left ${in_use_count} ${in_use_text} in use unselected (a process may be using the project)"
+    fi
+    [[ $# -gt 0 ]] || return 0
+    local review_text="artifact"
+    [[ $# -ne 1 ]] && review_text="artifacts"
+    echo ""
+    echo -e "${GRAY}Left $# review-only ${review_text} unselected; run mo purge in a terminal to review:${NC}"
+    local row
+    for row in "$@"; do
+        echo -e "  ${GRAY}${row}${NC}"
+    done
 }
 
 # Purge category selector.
@@ -2755,6 +2981,8 @@ clean_project_artifacts() {
     local -a item_activity_states=()
     local -a item_age_labels=()
     local -a item_cloud_flags=()
+    local -a item_review_flags=()
+    local -a item_in_use_flags=()
     local -a item_expected_parents=()
     local -a item_expected_parent_ids=()
     local -a item_expected_target_ids=()
@@ -2765,23 +2993,33 @@ clean_project_artifacts() {
     # The physical identity is authoritative; display text is never a selector.
     local -a project_roots=()
     local -a _cached_project_identities=()
+    local -a project_in_use_flags=()
     local _pre_idx
     local project_parent=""
     local project_root=""
     local project_identity=""
+    local project_in_use=false
+    # One ps and one lsof snapshot serve every row. A project a process names
+    # or works in, or one whose state is unknown, is never preselected; the
+    # final sink guard probes afresh before removal.
+    purge_take_process_snapshot
     for _pre_idx in "${!safe_to_clean[@]}"; do
         local artifact_path="${safe_to_clean[$_pre_idx]}"
         # Adjacent siblings share report-only ownership. Deletion still rebinds
         # every artifact to its original scan evidence at the final boundary.
         if [[ "${artifact_path%/*}" != "$project_parent" ]]; then
             project_parent="${artifact_path%/*}"
-            if ! project_root=$(find_purge_project_root_for_artifact "$artifact_path"); then
-                project_root="$project_parent"
-            fi
+            project_root=$(purge_artifact_project_root "$artifact_path")
             project_identity=$(mole_path_identity "$project_root")
+            project_in_use=true
+            _PURGE_PROCESS_PROBE_ROOT="$project_root"
+            if mole_clean_process_guard _purge_project_process_probe "in use"; then
+                project_in_use=false
+            fi
         fi
         project_roots[_pre_idx]="$project_root"
         _cached_project_identities[_pre_idx]="$project_identity"
+        project_in_use_flags[_pre_idx]="$project_in_use"
     done
 
     # Build menu options - one line per artifact
@@ -2834,6 +3072,12 @@ clean_project_artifacts() {
 
         local is_recent="${safe_recent_flags[$item_index]:-true}"
         local activity_state="${safe_activity_states[$item_index]:-uncertain}"
+        local is_review=false
+        is_purge_review_target "${item##*/}" && is_review=true
+        local is_in_use="${project_in_use_flags[$item_index]:-true}"
+        # The recent flag is what keeps a row out of the default selection,
+        # in the menu and under --yes alike.
+        [[ "$is_review" != "true" && "$is_in_use" != "true" ]] || is_recent=true
         local is_cloud=false
         if mole_purge_is_cloud_synced_path "$item"; then
             is_cloud=true
@@ -2855,6 +3099,8 @@ clean_project_artifacts() {
         item_recent_flags+=("$is_recent")
         item_activity_states+=("$activity_state")
         item_cloud_flags+=("$is_cloud")
+        item_review_flags+=("$is_review")
+        item_in_use_flags+=("$is_in_use")
         item_expected_parents+=("${safe_expected_parents[$item_index]}")
         item_expected_parent_ids+=("${safe_expected_parent_ids[$item_index]}")
         item_expected_target_ids+=("${safe_expected_target_ids[$item_index]}")
@@ -2865,7 +3111,11 @@ clean_project_artifacts() {
         [[ "$_mod_time" =~ ^[0-9]+$ ]] || _mod_time=$(get_file_mtime "$item" 2> /dev/null || echo "0")
         _age_secs=$((_now_epoch - _mod_time))
         _age_d=$((_age_secs / 86400))
-        if [[ "$activity_state" == "uncertain" ]]; then
+        if [[ "$is_review" == "true" ]]; then
+            item_age_labels+=("$(purge_review_target_label "${item##*/}")")
+        elif [[ "$is_in_use" == "true" ]]; then
+            item_age_labels+=("in use")
+        elif [[ "$activity_state" == "uncertain" ]]; then
             item_age_labels+=("unknown")
         elif [[ "$activity_state" == "recent" && $_age_d -ge $MIN_AGE_DAYS ]]; then
             item_age_labels+=("<${MIN_AGE_DAYS}d")
@@ -2958,6 +3208,8 @@ clean_project_artifacts() {
         local -a sorted_item_project_paths=()
         local -a sorted_item_age_labels=()
         local -a sorted_item_cloud_flags=()
+        local -a sorted_item_review_flags=()
+        local -a sorted_item_in_use_flags=()
         local -a sorted_item_expected_parents=()
         local -a sorted_item_expected_parent_ids=()
         local -a sorted_item_expected_target_ids=()
@@ -2975,6 +3227,8 @@ clean_project_artifacts() {
             sorted_item_project_paths+=("${item_project_paths[idx]}")
             sorted_item_age_labels+=("${item_age_labels[idx]}")
             sorted_item_cloud_flags+=("${item_cloud_flags[idx]}")
+            sorted_item_review_flags+=("${item_review_flags[idx]}")
+            sorted_item_in_use_flags+=("${item_in_use_flags[idx]}")
             sorted_item_expected_parents+=("${item_expected_parents[idx]}")
             sorted_item_expected_parent_ids+=("${item_expected_parent_ids[idx]}")
             sorted_item_expected_target_ids+=("${item_expected_target_ids[idx]}")
@@ -2993,6 +3247,8 @@ clean_project_artifacts() {
         item_project_paths=("${sorted_item_project_paths[@]}")
         item_age_labels=("${sorted_item_age_labels[@]}")
         item_cloud_flags=("${sorted_item_cloud_flags[@]}")
+        item_review_flags=("${sorted_item_review_flags[@]}")
+        item_in_use_flags=("${sorted_item_in_use_flags[@]}")
         item_expected_parents=("${sorted_item_expected_parents[@]}")
         item_expected_parent_ids=("${sorted_item_expected_parent_ids[@]}")
         item_expected_target_ids=("${sorted_item_expected_target_ids[@]}")
@@ -3047,9 +3303,20 @@ clean_project_artifacts() {
             return 0
         fi
     else
-        # Non-interactive: select all non-recent items
+        # Non-interactive: select all non-recent items. Review-only and in-use
+        # rows always need a person, even under --yes or in a dry run.
         local skipped_cloud_count=0
+        local -a held_review_rows=()
+        local held_in_use_count=0
         for ((i = 0; i < ${#menu_options[@]}; i++)); do
+            if [[ "${item_review_flags[i]:-true}" == "true" ]]; then
+                held_review_rows+=("${item_display_paths[i]} (${item_age_labels[i]})")
+                continue
+            fi
+            if [[ "${item_in_use_flags[i]:-true}" == "true" ]]; then
+                held_in_use_count=$((held_in_use_count + 1))
+                continue
+            fi
             if [[ "${item_cloud_flags[i]:-false}" == "true" && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
                 skipped_cloud_count=$((skipped_cloud_count + 1))
                 continue
@@ -3065,6 +3332,7 @@ clean_project_artifacts() {
             echo ""
             echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped ${skipped_cloud_count} cloud-synced ${skipped_cloud_text} in non-interactive mode (confirmation required)"
         fi
+        report_held_purge_rows "$held_in_use_count" "${held_review_rows[@]+"${held_review_rows[@]}"}"
     fi
     if [[ -z "$PURGE_SELECTION_RESULT" ]]; then
         echo ""
@@ -3208,6 +3476,7 @@ clean_project_artifacts() {
             local _MOLE_PURGE_FINAL_EXPECTED_PARENT_ID="$expected_parent_id"
             local _MOLE_PURGE_FINAL_EXPECTED_TARGET_ID="$expected_target_id"
             local _MOLE_SAFE_REMOVE_FINAL_GUARD="_mole_purge_final_remove_guard"
+            _MOLE_PURGE_FINAL_GUARD_REASON=""
             if safe_remove "$item_path" true "$size_kb" "" \
                 "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
                 if [[ "$dry_run_mode" == "1" || ! -e "$item_path" ]]; then
@@ -3230,7 +3499,11 @@ clean_project_artifacts() {
                     fi
                     return "$removal_status"
                 fi
-                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (final removal check failed; re-run mo purge to review it again)"
+                if [[ -n "$_MOLE_PURGE_FINAL_GUARD_REASON" ]]; then
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} Kept $display_item_path ($_MOLE_PURGE_FINAL_GUARD_REASON)"
+                else
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (final removal check failed; re-run mo purge to review it again)"
+                fi
             fi
         fi
         if [[ -t 1 ]]; then

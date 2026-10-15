@@ -462,3 +462,50 @@ EOT7
 PROBE
 SPIN-STOP"* ]]
 }
+
+@test "probe_project_artifact_hints never counts review-only names" {
+    local root="$HOME/hints-review-root"
+    mkdir -p "$root/proj/node_modules" "$root/proj/.terraform/providers" "$root/proj/.playwright-mcp"
+    touch "$root/proj/package.json"
+    printf '%s\n' "$root" > "$HOME/.config/mole/purge_paths"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOT1'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+run_with_timeout() { shift; "$@"; }
+probe_project_artifact_hints
+printf 'count=%s\n' "$PROJECT_ARTIFACT_HINT_COUNT"
+printf 'examples=%s\n' "${PROJECT_ARTIFACT_HINT_EXAMPLES[*]}"
+printf 'names=%s\n' "$(mole_purge_quick_hint_target_names | tr '\n' ' ')"
+EOT1
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"count=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *".terraform"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *".playwright-mcp"* ]] || { echo "$output"; return 1; }
+}
+
+@test "hint_get_path_size_kb_with_timeout keeps a signal status and the project hint stays partial" {
+    local root="$HOME/hints-root"
+    mkdir -p "$root/proj/node_modules"
+    touch "$root/proj/package.json"
+    printf '%s\n' "$root" > "$HOME/.config/mole/purge_paths"
+    mole_test_fake_command du 'exit 130'
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+rc=0
+hint_get_path_size_kb_with_timeout "$HOME" 2 > /dev/null || rc=$?
+echo "RC=$rc"
+probe_project_artifact_hints
+echo "count=$PROJECT_ARTIFACT_HINT_COUNT partial=$PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL samples=$PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES"
+EOT
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=130"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"count=1 partial=true samples=0"* ]]
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 load helpers/common
+load helpers/staged_updates
 
 setup_file() {
     mole_test_setup_home user-core
@@ -320,6 +321,56 @@ printf 'CLEAN_RC=%s GIP=%s CCT=%s ORD=%s\n' \
 EOF
 
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    rm -rf "$test_home"
+}
+
+@test "clean_user_essentials previews superseded updater caches and keeps pending or running ones" {
+    local test_home="$HOME/updater-cache-sweep-home"
+    local caches="$test_home/Library/Caches"
+    staged_update_make_bundle "$test_home/Applications/Foo.app" com.foo 1.0 100
+    printf 'updaterCacheDirName: foo-updater\n' \
+        > "$test_home/Applications/Foo.app/Contents/Resources/app-update.yml"
+    staged_update_make_bundle "$test_home/Applications/Bar.app" com.bar 2.0 200
+    printf 'updaterCacheDirName: bar-updater\n' \
+        > "$test_home/Applications/Bar.app/Contents/Resources/app-update.yml"
+    mkdir -p "$test_home/SystemApplications" "$caches/ordinary-app" "$caches/bar-updater"
+    # Superseded: staged at the installed version.
+    staged_update_make_bundle "$caches/com.foo.ShipIt/update.A/Foo.app" com.foo 1.0 100
+    staged_update_make_bundle "$test_home/stage/Foo.app" com.foo 1.0 100
+    staged_update_make_pending_zip "$caches/foo-updater" "$test_home/stage" Foo.app
+    # Pending: staged newer than installed. Running: Bar's owner is live.
+    staged_update_make_bundle "$caches/com.bar.ShipIt/update.B/Bar.app" com.bar 3.0 300
+    printf 'zip\n' > "$caches/bar-updater/update.zip"
+
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_TEST_MODE=1 MOLE_TEST_NO_AUTH=1 \
+        MOLE_TEST_APPLICATIONS_DIR="$test_home/SystemApplications" \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=true
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+register_dry_run_cleanup_target() { return 0; }
+append_dry_run_cleanup_target() { printf 'DRY|%s\n' "$1"; }
+ps() {
+    [[ "$*" == *args* ]] || return 0
+    printf '  PID  PPID COMM ARGS\n'
+    printf '  900     1 /usr/sbin/cfprefsd /usr/sbin/cfprefsd agent\n'
+    printf '  901     1 %s %s\n' "$HOME/Applications/Bar.app/Contents/MacOS/Bar" \
+        "$HOME/Applications/Bar.app/Contents/MacOS/Bar"
+}
+clean_user_essentials
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DRY|$caches/ordinary-app"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"DRY|$caches/com.foo.ShipIt"* ]] || return 1
+    [[ "$output" == *"DRY|$caches/foo-updater"* ]] || return 1
+    [[ "$output" != *"DRY|$caches/com.bar.ShipIt"* ]] || return 1
+    [[ "$output" != *"DRY|$caches/bar-updater"* ]] || return 1
+    [[ -d "$caches/com.bar.ShipIt/update.B/Bar.app" ]] || return 1
     rm -rf "$test_home"
 }
 

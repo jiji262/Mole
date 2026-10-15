@@ -3248,6 +3248,8 @@ SCRIPT
 	mkdir -p "$HOME/www/beta/node_modules"
 	echo '{}' > "$HOME/www/alpha/package.json"
 	echo '{}' > "$HOME/www/beta/package.json"
+	# A venv is purgeable only as a real env beside its own Python manifest.
+	touch "$HOME/www/alpha/.venv/pyvenv.cfg" "$HOME/www/alpha/pyproject.toml"
 	dd if=/dev/zero of="$HOME/www/alpha/node_modules/data" bs=1024 count=130 2>/dev/null
 	dd if=/dev/zero of="$HOME/www/alpha/.venv/data" bs=1024 count=110 2>/dev/null
 	dd if=/dev/zero of="$HOME/www/beta/node_modules/data" bs=1024 count=200 2>/dev/null
@@ -5022,4 +5024,365 @@ EOF
 	[[ "$output" == *"~/many-skipped-1666/p10"*"(status 124)"* ]] || { echo "$output"; return 1; }
 	[[ "$output" != *"~/many-skipped-1666/p11"* ]] || { echo "$output"; return 1; }
 	[[ "$output" == *"and 3 more"* ]] || { echo "$output"; return 1; }
+}
+
+# ---------------------------------------------------------------------------
+# Python env manifests, live processes in a project, and review-only names.
+# ---------------------------------------------------------------------------
+
+# A user-scope cwd listing in which no process works inside a fixture.
+_purge_fake_idle_lsof() {
+    mole_test_fake_command lsof 'printf "p1\nfcwd\nn/\n"'
+}
+
+# Age every fixture entry past the 7-day activity window.
+_purge_age_fixture() {
+    find "$@" -exec touch -t 202001010000 {} +
+}
+
+# Print the is_protected_purge_artifact status for one path as PROTECT_RC=<n>.
+_purge_protect_rc() {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET="$1" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+rc=0
+is_protected_purge_artifact "$TARGET" || rc=$?
+printf 'PROTECT_RC=%s UNVERIFIED=%s\n' "$rc" "$PURGE_PROTECTION_UNVERIFIED"
+EOF
+}
+
+# A venv fixture beside an optional manifest, with 8KB of content.
+_purge_venv_fixture() {
+    local env_dir="$1"
+    mkdir -p "$env_dir/lib"
+    dd if=/dev/zero of="$env_dir/lib/x" bs=1024 count=8 2> /dev/null
+}
+
+@test "purge protects .venv without a Python manifest" {
+    rm -f "$HOME/.config/mole/purge_paths"
+    _purge_fake_idle_lsof
+    _purge_venv_fixture "$HOME/www/app/.venv"
+    touch "$HOME/www/app/package.json" "$HOME/www/app/.venv/pyvenv.cfg"
+    mkdir -p "$HOME/www/app/node_modules" "$HOME/.config/mole"
+    dd if=/dev/zero of="$HOME/www/app/node_modules/y" bs=1024 count=8 2> /dev/null
+    _purge_age_fixture "$HOME/www"
+    printf '%s\n' "$HOME/www" > "$HOME/.config/mole/purge_paths"
+
+    _purge_protect_rc "$HOME/www/app/.venv"
+    [[ "$output" == *"PROTECT_RC=0 UNVERIFIED=false"* ]] || { echo "$output"; return 1; }
+
+    run env HOME="$HOME" TERM=xterm-256color MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/mole" purge --dry-run < /dev/null
+    rm -f "$HOME/.config/mole/purge_paths"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # Control: the run did reach the menu stage for this project.
+    [[ "$output" == *"app/node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"app/.venv"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge protects venv lacking pyvenv.cfg" {
+    mkdir -p "$HOME/www/app/venv"
+    touch "$HOME/www/app/pyproject.toml"
+    printf 'notes\n' > "$HOME/www/app/venv/notes.txt"
+    _purge_protect_rc "$HOME/www/app/venv"
+    [[ "$output" == *"PROTECT_RC=0 UNVERIFIED=false"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge allows .venv with pyvenv.cfg and pyproject.toml" {
+    _purge_venv_fixture "$HOME/www/app/.venv"
+    touch "$HOME/www/app/pyproject.toml" "$HOME/www/app/.venv/pyvenv.cfg"
+    _purge_protect_rc "$HOME/www/app/.venv"
+    [[ "$output" == *"PROTECT_RC=1 UNVERIFIED=false"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge allows .venv beside requirements-dev.txt" {
+    _purge_venv_fixture "$HOME/www/app/.venv"
+    touch "$HOME/www/app/requirements-dev.txt" "$HOME/www/app/.venv/pyvenv.cfg"
+    _purge_protect_rc "$HOME/www/app/.venv"
+    [[ "$output" == *"PROTECT_RC=1 UNVERIFIED=false"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge protects .venv whose pyproject.toml is a symlink" {
+    _purge_venv_fixture "$HOME/www/app/.venv"
+    mkdir -p "$HOME/www/shared"
+    touch "$HOME/www/shared/pyproject.toml" "$HOME/www/app/.venv/pyvenv.cfg"
+    ln -s "$HOME/www/shared/pyproject.toml" "$HOME/www/app/pyproject.toml"
+    _purge_protect_rc "$HOME/www/app/.venv"
+    [[ "$output" == *"PROTECT_RC=0 UNVERIFIED=false"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge protects .venv whose pyvenv.cfg is a symlink" {
+    _purge_venv_fixture "$HOME/www/app/.venv"
+    touch "$HOME/www/app/pyproject.toml" "$HOME/www/pyvenv.cfg"
+    ln -s "$HOME/www/pyvenv.cfg" "$HOME/www/app/.venv/pyvenv.cfg"
+    _purge_protect_rc "$HOME/www/app/.venv"
+    [[ "$output" == *"PROTECT_RC=0 UNVERIFIED=false"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge protects .venv whose only manifest is in a grandparent" {
+    _purge_venv_fixture "$HOME/www/mono/pkg/.venv"
+    touch "$HOME/www/mono/pyproject.toml" "$HOME/www/mono/pkg/package.json" "$HOME/www/mono/pkg/.venv/pyvenv.cfg"
+    _purge_protect_rc "$HOME/www/mono/pkg/.venv"
+    [[ "$output" == *"PROTECT_RC=0 UNVERIFIED=false"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge final sink refuses a .venv whose manifest vanished after review" {
+    _purge_fake_idle_lsof
+    _purge_venv_fixture "$HOME/www/app/.venv"
+    touch "$HOME/www/app/pyproject.toml" "$HOME/www/app/.venv/pyvenv.cfg"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+venv="$HOME/www/app/.venv"
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$venv" > "$2"; }
+get_dir_size_kb() { echo 8; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
+activity_calls=0
+# The first call is the loop's recheck, after its own protection check; only
+# the final sink guard can see the manifest disappear.
+purge_target_activity_still_safe() {
+    activity_calls=$((activity_calls + 1))
+    [[ $activity_calls -ne 1 ]] || rm -f "$HOME/www/app/pyproject.toml"
+    return 0
+}
+unset MOLE_DRY_RUN
+clean_project_artifacts < /dev/null
+[[ -d "$venv" ]] || { echo REMOVED; exit 1; }
+echo KEPT
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"KEPT"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"final removal check failed"* ]] || { echo "$output"; return 1; }
+}
+
+# Runs one non-interactive purge over $HOME/www/app/node_modules, then calls
+# the final sink guard on it directly with every other check satisfied.
+# PURGE_TEST_CWD, when set, is the purge shell's own working directory.
+_purge_run_in_use_project() {
+    mkdir -p "$HOME/www/app/node_modules"
+    touch "$HOME/www/app/package.json"
+    dd if=/dev/zero of="$HOME/www/app/node_modules/y" bs=1024 count=8 2> /dev/null
+    _purge_age_fixture "$HOME/www"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PURGE_TEST_CWD="${PURGE_TEST_CWD:-}" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+artifact="$HOME/www/app/node_modules"
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$artifact" > "$2"; }
+get_dir_size_kb() { echo 8; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
+safe_remove() { printf 'REMOVE:%s\n' "$1"; }
+unset MOLE_DRY_RUN
+[[ -z "${PURGE_TEST_CWD:-}" ]] || cd "$PURGE_TEST_CWD"
+clean_project_artifacts < /dev/null
+guard_rc=0
+_MOLE_PURGE_FINAL_ACTIVITY_STATE=recent _mole_purge_final_remove_guard "$artifact" || guard_rc=$?
+printf 'GUARD_RC=%s REASON=%s\n' "$guard_rc" "$_MOLE_PURGE_FINAL_GUARD_REASON"
+[[ -d "$artifact" ]] || exit 1
+EOF
+}
+
+@test "purge keeps a project whose path is in a running process argv" {
+    _purge_fake_idle_lsof
+    # shellcheck disable=SC2016 # Expanded by the fake command at execution time.
+    mole_test_fake_command ps 'case "$*" in
+    *pid=,comm=*) printf "4242 /usr/local/bin/node\n" ;;
+    *) printf "  PID  PPID COMM ARGS\n"
+       printf " 4242     1 node node %s/www/app/server.js\n" "$HOME" ;;
+esac'
+    _purge_run_in_use_project
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE:"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"in use"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD_RC=1 REASON=process running in project"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge keeps a project that is a process cwd" {
+    # shellcheck disable=SC2016 # Expanded by the fake command at execution time.
+    mole_test_fake_command lsof 'printf "p4242\nfcwd\nn%s/www/app\n" "$HOME"'
+    _purge_run_in_use_project
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE:"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"in use"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD_RC=1 REASON=process running in project"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge ignores a process cwd in a sibling with a shared prefix" {
+    # shellcheck disable=SC2016 # Expanded by the fake command at execution time.
+    mole_test_fake_command lsof 'printf "p4242\nfcwd\nn%s/www/app-two\n" "$HOME"'
+    mkdir -p "$HOME/www/app-two"
+    _purge_run_in_use_project
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"REMOVE:$HOME/www/app/node_modules"* ]] || { echo "$output"; return 1; }
+}
+
+# Mole's own process tree (the shell running purge, its ancestors, and the
+# lsof it forks) never votes: `mo purge` run from inside a project would
+# otherwise always find that project in use. Uses the real lsof.
+@test "purge ignores its own working directory inside the project" {
+    command -v lsof > /dev/null || skip "lsof not available"
+    mkdir -p "$HOME/www/app/src"
+    PURGE_TEST_CWD="$HOME/www/app/src" _purge_run_in_use_project
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"REMOVE:$HOME/www/app/node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"in use"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"process running in project"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge drops only its own process tree from the cwd listing" {
+    # The fake lsof reports itself and every ancestor (the purge shell and
+    # its callers) as working inside the project, and one outsider at /.
+    # shellcheck disable=SC2016 # Expanded by the fake command at execution time.
+    mole_test_fake_command lsof 'pid=$$
+while [[ "$pid" -gt 1 ]]; do
+    parent=$(/bin/ps -o ppid= -p "$pid" | tr -d " ")
+    printf "p%s\nR%s\nfcwd\nn%s/www/app\n" "$pid" "$parent" "$HOME"
+    pid=$parent
+done
+printf "p4242\nR1\nfcwd\nn/\n"'
+    _purge_run_in_use_project
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"REMOVE:$HOME/www/app/node_modules"* ]] || { echo "$output"; return 1; }
+
+    # Control: an outsider working inside the project still counts.
+    # shellcheck disable=SC2016 # Expanded by the fake command at execution time.
+    mole_test_fake_command lsof 'printf "p4242\nR1\nfcwd\nn%s/www/app\n" "$HOME"'
+    _purge_run_in_use_project
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE:"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD_RC=1 REASON=process running in project"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge treats a failed cwd probe as unknown" {
+    mole_test_fake_command lsof 'echo "lsof: boom" >&2; exit 1'
+    _purge_run_in_use_project
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE:"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"in use"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"GUARD_RC=1 REASON=could not check processes in project"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge --yes never selects review-only rows" {
+    _purge_fake_idle_lsof
+    mkdir -p "$HOME/www/tf/.terraform/providers" "$HOME/www/web/node_modules" "$HOME/.config/mole"
+    touch "$HOME/www/tf/main.tf" "$HOME/www/web/package.json"
+    printf '.terraform/\n' > "$HOME/www/tf/.gitignore"
+    git -C "$HOME/www/tf" init -q
+    dd if=/dev/zero of="$HOME/www/tf/.terraform/providers/x" bs=1024 count=8 2> /dev/null
+    dd if=/dev/zero of="$HOME/www/web/node_modules/y" bs=1024 count=8 2> /dev/null
+    _purge_age_fixture "$HOME/www"
+    printf '%s\n' "$HOME/www" > "$HOME/.config/mole/purge_paths"
+
+    run env HOME="$HOME" TERM=xterm-256color MOLE_TEST_NO_AUTH=1 MOLE_PURGE_YES=1 "$PROJECT_ROOT/mole" purge --yes < /dev/null
+    rm -f "$HOME/.config/mole/purge_paths"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -d "$HOME/www/tf/.terraform/providers" ]] || { echo "$output"; return 1; }
+    # Control: the same run removed the ordinary artifact.
+    [[ ! -e "$HOME/www/web/node_modules" ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"review-only"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"~/www/tf/.terraform"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge omits review-only names that git does not ignore and never offers .wrangler" {
+    mkdir -p "$HOME/www/plain/.terraform/providers" "$HOME/www/kept/.terraform/providers" \
+        "$HOME/www/edge/.wrangler/state/v3"
+    for repo in plain kept edge; do
+        touch "$HOME/www/$repo/main.tf"
+        git -C "$HOME/www/$repo" init -q
+        printf 'x\n' > "$HOME/www/$repo/data"
+    done
+    printf 'x\n' > "$HOME/www/plain/.terraform/providers/x"
+    printf 'x\n' > "$HOME/www/kept/.terraform/providers/x"
+    printf 'x\n' > "$HOME/www/edge/.wrangler/state/v3/db.sqlite"
+    printf '.terraform/\n' > "$HOME/www/kept/.gitignore"
+    printf '.wrangler/\n' > "$HOME/www/edge/.gitignore"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/.cache/mole"
+out=$(mktemp)
+scan_purge_targets "$HOME/www" "$out"
+sed 's/^/FOUND:/' "$out"
+rm -f "$out"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # Control: an ignored .terraform is discovered.
+    [[ "$output" == *"FOUND:$HOME/www/kept/.terraform"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"FOUND:$HOME/www/plain/.terraform"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *".wrangler"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge offers .playwright-mcp outside git unselected" {
+    _purge_fake_idle_lsof
+    local outside="$BATS_TEST_TMPDIR/outside-git"
+    mkdir -p "$outside/web/.playwright-mcp" "$outside/web/node_modules"
+    touch "$outside/web/package.json"
+    printf 'x\n' > "$outside/web/.playwright-mcp/page.yml"
+    printf 'x\n' > "$outside/web/node_modules/y"
+    _purge_age_fixture "$outside"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" OUTSIDE="$outside" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mole_find_git_repo_root "$OUTSIDE/web" && { echo "FIXTURE_IN_GIT:$MOLE_GIT_REPO_ROOT"; exit 1; }
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$OUTSIDE")
+get_dir_size_kb() { echo 4; }
+safe_remove() { printf 'REMOVE:%s\n' "$1"; }
+export MOLE_DRY_RUN=1
+clean_project_artifacts < /dev/null
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"REMOVE:$outside/web/node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE:$outside/web/.playwright-mcp"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"review-only"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"web/.playwright-mcp"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge treats .swc as an ordinary old artifact" {
+    _purge_fake_idle_lsof
+    mkdir -p "$HOME/www/app/.swc/plugins"
+    touch "$HOME/www/app/package.json"
+    printf 'x\n' > "$HOME/www/app/.swc/plugins/x"
+    _purge_age_fixture "$HOME/www"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$HOME/www")
+get_dir_size_kb() { echo 4; }
+safe_remove() { printf 'REMOVE:%s\n' "$1"; }
+export MOLE_DRY_RUN=1
+clean_project_artifacts < /dev/null
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"REMOVE:$HOME/www/app/.swc"* ]] || { echo "$output"; return 1; }
+}
+
+@test "is_project_container rejects review-only names" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+for name in "${MOLE_PURGE_REVIEW_TARGETS[@]}"; do
+    mkdir -p "$HOME/$name/mod"
+    touch "$HOME/$name/mod/package.json"
+    if is_project_container "$HOME/$name" 2; then
+        echo "FAIL: $name classified as container"
+        exit 1
+    fi
+done
+printf 'checked=%s\n' "${#MOLE_PURGE_REVIEW_TARGETS[@]}"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"checked=2"* ]] || { echo "$output"; return 1; }
 }

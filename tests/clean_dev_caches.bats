@@ -656,6 +656,7 @@ start_section_spinner() { :; }
 stop_section_spinner() { :; }
 clean_tool_cache() { :; }
 safe_clean() { echo "$2|$1"; }
+clean_npm_npx_cache() { echo "NPX|$1|$2"; }
 note_activity() { :; }
 run_with_timeout() { shift; "$@"; }
 npm() {
@@ -670,9 +671,230 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"npm cache directory|$HOME/.npm/_cacache/*"* ]] || return 1
-    [[ "$output" == *"npm npx cache|$HOME/.npm/_npx/*"* ]] || return 1
+    [[ "$output" == *"NPX|$HOME/.npm|npm npx cache"* ]] || return 1
+    [[ "$output" != *"_npx/*"* ]] || return 1
     [[ "$output" == *"npm logs|$HOME/.npm/_logs/*"* ]] || return 1
     [[ "$output" == *"npm prebuilds|$HOME/.npm/_prebuilds/*"* ]]
+}
+
+# npx runs MCP servers straight out of ~/.npm/_npx/<hash>, so the old
+# `_npx/*` row deleted the code under a running server. Each entry is now its
+# own candidate: 16-hex name, real directory, idle for MOLE_TEMP_FILE_AGE_DAYS,
+# and not named by any running process's argv.
+npx_case_home() {
+    local case_home="$HOME/npx-case-$BATS_TEST_NUMBER"
+    rm -rf "$case_home"
+    mkdir -p "$case_home"
+    printf '%s\n' "$case_home"
+}
+
+age_npx_tree() {
+    local old_stamp
+    old_stamp=$(date -v-30d +%Y%m%d%H%M)
+    find "$1" -exec touch -h -t "$old_stamp" {} +
+}
+
+# Prints a ps table naming every path listed in $HOME/ps-busy, one per line.
+npx_fake_ps_body() {
+    cat <<'BODY'
+[[ "$*" == *args* ]] || exit 0
+printf '  PID  PPID COMM ARGS\n'
+printf '  100     1 launchd /sbin/launchd\n'
+if [[ -f "$HOME/ps-busy" ]]; then
+    while IFS= read -r busy; do
+        printf '  4242     1 node node %s\n' "$busy"
+    done < "$HOME/ps-busy"
+fi
+BODY
+}
+
+@test "clean_npm_npx_cache keeps an _npx entry referenced by a running process" {
+    local case_home
+    case_home=$(npx_case_home)
+    local npx_root="$case_home/.npm/_npx"
+    mkdir -p "$npx_root/0123456789abcdef/node_modules/.bin" "$npx_root/fedcba9876543210"
+    printf 'bin\n' > "$npx_root/0123456789abcdef/node_modules/.bin/x"
+    printf '{}\n' > "$npx_root/fedcba9876543210/package.json"
+    age_npx_tree "$npx_root"
+    printf '%s\n' "$npx_root/0123456789abcdef/node_modules/.bin/x" > "$case_home/ps-busy"
+    mole_test_fake_command ps "$(npx_fake_ps_body)"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+clean_npm_npx_cache "$HOME/.npm" "npm npx cache"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$npx_root/0123456789abcdef/node_modules/.bin/x" ] || return 1
+    [ ! -e "$npx_root/fedcba9876543210" ] || return 1
+    [ -d "$npx_root" ] || return 1
+    [[ "$output" == *"DEFER=npx"* ]]
+}
+
+@test "clean_npm_npx_cache keeps every entry when ps fails" {
+    local case_home
+    case_home=$(npx_case_home)
+    local npx_root="$case_home/.npm/_npx"
+    mkdir -p "$npx_root/0123456789abcdef" "$npx_root/fedcba9876543210"
+    age_npx_tree "$npx_root"
+    mole_test_fake_command ps 'exit 1'
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+clean_npm_npx_cache "$HOME/.npm" "npm npx cache"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -d "$npx_root/0123456789abcdef" ] || return 1
+    [ -d "$npx_root/fedcba9876543210" ] || return 1
+    [[ "$output" == *"npm npx cache · stopped (process state unknown)"* ]]
+}
+
+@test "clean_npm_npx_cache keeps entries modified within MOLE_TEMP_FILE_AGE_DAYS" {
+    local case_home
+    case_home=$(npx_case_home)
+    local npx_root="$case_home/.npm/_npx"
+    mkdir -p "$npx_root/0123456789abcdef" "$npx_root/fedcba9876543210"
+    age_npx_tree "$npx_root"
+    # One entry is fresh itself, the other only through a direct child.
+    touch "$npx_root/0123456789abcdef"
+    printf '{}\n' > "$npx_root/fedcba9876543210/package.json"
+    touch -t "$(date -v-30d +%Y%m%d%H%M)" "$npx_root/fedcba9876543210"
+    mole_test_fake_command ps "$(npx_fake_ps_body)"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$*"; }
+safe_clean_guarded() { printf 'UNEXPECTED_SINK=%s\n' "$*"; }
+clean_npm_npx_cache "$HOME/.npm" "npm npx cache"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"UNEXPECTED_"* ]] || return 1
+    [[ "$output" != *"DEFER="* ]]
+}
+
+@test "clean_npm_npx_cache skips symlinked and non-16-hex entries" {
+    local case_home
+    case_home=$(npx_case_home)
+    local npx_root="$case_home/.npm/_npx"
+    mkdir -p "$npx_root/abc" "$npx_root/0123456789ABCDEF" "$npx_root/0123456789abcdef0" "$case_home/outside"
+    printf 'keep\n' > "$case_home/outside/keep"
+    ln -s "$case_home/outside" "$npx_root/0123456789abcdef"
+    age_npx_tree "$npx_root"
+    age_npx_tree "$case_home/outside"
+    mole_test_fake_command ps "$(npx_fake_ps_body)"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$*"; }
+safe_clean_guarded() { printf 'UNEXPECTED_SINK=%s\n' "$*"; }
+clean_npm_npx_cache "$HOME/.npm" "npm npx cache"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"UNEXPECTED_"* ]] || return 1
+    [ -f "$case_home/outside/keep" ] || return 1
+    [ -d "$npx_root/abc" ]
+}
+
+@test "clean_npm_npx_cache rechecks the leaf at the sink" {
+    local case_home
+    case_home=$(npx_case_home)
+    local npx_root="$case_home/.npm/_npx"
+    mkdir -p "$npx_root/0123456789abcdef"
+    age_npx_tree "$npx_root"
+    mole_test_fake_command ps "$(npx_fake_ps_body)"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+# The server starts between discovery and the deletion boundary.
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    printf '%s/node_modules/.bin/x\n' "$1" > "$HOME/ps-busy"
+    "$guard" "$1" || return 75
+    safe_clean "$@"
+}
+clean_npm_npx_cache "$HOME/.npm" "npm npx cache"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER=npx"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || return 1
+    [ -d "$npx_root/0123456789abcdef" ]
+}
+
+@test "clean_npm_npx_cache applies the same guard to the custom npm cache path" {
+    local case_home
+    case_home=$(npx_case_home)
+    local custom_root="$case_home/custom-npm-cache"
+    mkdir -p "$custom_root/_npx/0123456789abcdef" "$custom_root/_npx/fedcba9876543210"
+    age_npx_tree "$custom_root/_npx"
+    printf '%s\n' "$custom_root/_npx/0123456789abcdef" > "$case_home/ps-busy"
+    mole_test_fake_command ps "$(npx_fake_ps_body)"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" CUSTOM_ROOT="$custom_root" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+clean_tool_cache() { :; }
+clean_pnpm_stores() { :; }
+clean_corepack_cache() { :; }
+bun() { return 1; }
+run_with_timeout() { shift; "$@"; }
+note_activity() { :; }
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        printf 'CLEAN=%s|%s\n' "$description" "$1"
+        shift
+    done
+}
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    "$guard" "$1" || return 75
+    safe_clean "$@"
+}
+npm() {
+    if [[ "$1" == "config" && "$2" == "get" && "$3" == "cache" ]]; then
+        echo "$CUSTOM_ROOT"
+        return 0
+    fi
+    return 0
+}
+clean_dev_npm
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN=npm npx cache (custom path)|$custom_root/_npx/fedcba9876543210"* ]] || return 1
+    [[ "$output" != *"$custom_root/_npx/0123456789abcdef"* ]] || return 1
+    [[ "$output" != *"_npx/*"* ]] || return 1
+    [[ "$output" == *"DEFER=npx"* ]]
 }
 
 @test "clean_dev_jvm never enters daemon cleanup while Gradle is running" {
@@ -1078,6 +1300,7 @@ start_section_spinner() { :; }
 stop_section_spinner() { :; }
 clean_tool_cache() { :; }
 safe_clean() { echo "$2|$1"; }
+clean_npm_npx_cache() { echo "NPX|$1|$2"; }
 note_activity() { :; }
 run_with_timeout() { shift; "$@"; }
 npm() {
@@ -1093,7 +1316,9 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"npm cache directory|$HOME/.npm/_cacache/*"* ]] || return 1
     [[ "$output" == *"npm cache directory (custom path)|/tmp/mole-custom-npm-cache/_cacache/*"* ]] || return 1
-    [[ "$output" == *"npm npx cache (custom path)|/tmp/mole-custom-npm-cache/_npx/*"* ]] || return 1
+    [[ "$output" == *"NPX|$HOME/.npm|npm npx cache"* ]] || return 1
+    [[ "$output" == *"NPX|/tmp/mole-custom-npm-cache|npm npx cache (custom path)"* ]] || return 1
+    [[ "$output" != *"_npx/*"* ]] || return 1
     [[ "$output" == *"npm logs (custom path)|/tmp/mole-custom-npm-cache/_logs/*"* ]] || return 1
     [[ "$output" == *"npm prebuilds (custom path)|/tmp/mole-custom-npm-cache/_prebuilds/*"* ]]
 }
@@ -1384,6 +1609,28 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"Docker unused data · review with docker system df"* ]] || return 1
     [[ "$output" == *"Docker BuildX cache"* ]] || return 1
+    [[ "$output" != *"docker called"* ]]
+}
+
+@test "clean_dev_docker names the owner prune commands only when docker exists" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { :; }
+note_activity() { :; }
+debug_log() { :; }
+docker() { echo "docker called"; return 0; }
+clean_dev_docker
+unset -f docker
+echo "--- no docker ---"
+PATH="/usr/bin:/bin"
+clean_dev_docker
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Docker unused data · review with docker system df · docker image prune -a · docker builder prune"*"--- no docker ---"* ]] || { echo "$output"; return 1; }
+    [[ "${output#*--- no docker ---}" != *"docker image prune"* ]] || { echo "$output"; return 1; }
     [[ "$output" != *"docker called"* ]]
 }
 
