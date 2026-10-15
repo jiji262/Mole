@@ -16,7 +16,7 @@ show_clean_help() {
 show_installer_help() {
     echo "Usage: mo installer [OPTIONS]"
     echo ""
-    echo "Find and remove installer files (.dmg, .pkg, .iso, .xip, .zip)."
+    echo "Find and remove installers (.dmg, .pkg, .iso, .xip, .zip, .exe, .msi) and stale partial downloads."
     echo ""
     echo "Options:"
     echo "  --dry-run         Preview installer cleanup without making changes"

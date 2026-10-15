@@ -13,6 +13,9 @@ fi
 source "$PROJECT_LIB_DIR/purge_shared.sh"
 
 readonly PURGE_TARGETS=("${MOLE_PURGE_TARGETS[@]}")
+# Every directory name discovery reports: ordinary targets plus the names that
+# are only ever listed for review (never preselected).
+readonly PURGE_SCAN_NAMES=("${MOLE_PURGE_TARGETS[@]}" "${MOLE_PURGE_REVIEW_TARGETS[@]}")
 # Minimum age in days before considering for cleanup.
 readonly MIN_AGE_DAYS=7
 # Scan depth defaults (relative to search root).
@@ -63,9 +66,10 @@ is_project_container() {
     # up to date, and recovery needs a network restore, which purge must never
     # require (#1459). Same shape for vendor/ and Pods/. A container that
     # happens to share an artifact name stays reachable through
-    # ~/.config/mole/purge_paths, which bypasses discovery.
+    # ~/.config/mole/purge_paths, which bypasses discovery. Review-only names
+    # are artifacts too.
     local purge_target
-    for purge_target in "${PURGE_TARGETS[@]}"; do
+    for purge_target in "${PURGE_SCAN_NAMES[@]}"; do
         if [[ "$basename" == "$purge_target" ]]; then
             return 1
         fi
@@ -849,7 +853,7 @@ _is_swiftpm_scratch_root() {
     base="${base##*/}"
     [[ -d "$dir" && ! -L "$dir" ]] || return 1
     [[ "$base" != ".build" ]] || return 0
-    for target in "${MOLE_PURGE_TARGETS[@]}"; do
+    for target in "${PURGE_SCAN_NAMES[@]}"; do
         [[ "$base" != "$target" ]] || return 1
     done
     tag="$dir/$MOLE_CACHEDIR_TAG_NAME"
@@ -939,6 +943,65 @@ emit_purge_candidate_or_swiftpm_outputs() {
     printf '%s\n' "$item"
 }
 
+# The name venv proves nothing: conda envs, data folders and hand-made trees
+# use it too. Purge one only when it is a real virtualenv (a regular
+# pyvenv.cfg) beside a manifest in its own directory that can rebuild it.
+# A grandparent or monorepo manifest does not count, nor does a symlink.
+# Returns 0 to protect and 1 when both hold; any failed probe protects.
+is_unrebuildable_python_env() {
+    local path="${1%/}"
+    local deadline="${2:-}"
+    path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || return 0
+    [[ -f "$path/pyvenv.cfg" && ! -L "$path/pyvenv.cfg" ]] || return 0
+
+    local parent="${path%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    local manifest
+    for manifest in "${MOLE_PURGE_PYTHON_MANIFESTS[@]}"; do
+        [[ -f "$parent/$manifest" && ! -L "$parent/$manifest" ]] && return 1
+    done
+
+    local probe_timeout="" requirements=""
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" "$deadline") || return 0
+    # -type f without -L never counts a symlinked requirements file.
+    requirements=$(run_with_timeout "$probe_timeout" /usr/bin/find "$parent" -maxdepth 1 \
+        -type f -name 'requirements*.txt' -print -quit 2> /dev/null) || return 0
+    [[ -z "$requirements" ]]
+}
+
+is_purge_review_target() {
+    local name="$1" review_name
+    for review_name in "${MOLE_PURGE_REVIEW_TARGETS[@]}"; do
+        [[ "$name" == "$review_name" ]] && return 0
+    done
+    return 1
+}
+
+# Age-column label for a review-only row: why it is never preselected.
+purge_review_target_label() {
+    case "$1" in
+        .terraform) printf '%s\n' "review: may hold state" ;;
+        *) printf '%s\n' "review: may hold saved output" ;;
+    esac
+}
+
+# Inside a Git work tree a review-only directory is offered only when Git
+# ignores it: an unignored one is project content, not a disposable artifact.
+# Returns 0 to withhold the row, 1 to offer it. Outside Git it is offered,
+# still unselected. A failed or timed-out check withholds it.
+purge_review_artifact_withheld() {
+    local path="${1%/}"
+    local deadline="${2:-}"
+    path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || return 0
+    mole_find_git_repo_root "$path" || return 1
+
+    local ignore_rc=0
+    mole_git_check_ignore "$MOLE_GIT_REPO_ROOT" "$deadline" "$path" || ignore_rc=$?
+    [[ $ignore_rc -eq 0 ]] && return 1
+    debug_log "Withholding review-only artifact (git check-ignore status $ignore_rc): $path"
+    return 0
+}
+
 is_protected_purge_artifact() {
     local path="${1%/}"
     local deadline="${2:-}"
@@ -1009,7 +1072,9 @@ is_protected_purge_artifact() {
             return $?
             ;;
         venv | .venv)
-            [[ -f "$path/pyvenv.cfg" ]] || return 1
+            if is_unrebuildable_python_env "$path" "$deadline"; then
+                return 0
+            fi
             _purge_running_project_protects "$path" "$deadline"
             return $?
             ;;
@@ -1027,6 +1092,10 @@ is_protected_purge_artifact() {
         return "$swiftpm_rc"
     fi
 
+    if is_purge_review_target "$base"; then
+        purge_review_artifact_withheld "$path" "$deadline"
+        return $?
+    fi
     return 1
 }
 
@@ -1073,7 +1142,7 @@ _purge_walk_expressions() {
     done
     [[ "$with_dataless" != "yes" ]] || _PURGE_PRUNE_EXPR+=(-o -flags +dataless)
     _PURGE_TARGET_EXPR=()
-    for name in "${PURGE_TARGETS[@]}"; do
+    for name in "${PURGE_SCAN_NAMES[@]}"; do
         [[ ${#_PURGE_TARGET_EXPR[@]} -eq 0 ]] || _PURGE_TARGET_EXPR+=(-o)
         _PURGE_TARGET_EXPR+=(-name "$name")
     done
@@ -1286,7 +1355,7 @@ scan_purge_targets() {
     elif command -v fd > /dev/null 2>&1; then
         # Escape regex special characters in target names for fd patterns (single sed pass)
         local _escaped_lines
-        _escaped_lines=$(printf '%s\n' "${PURGE_TARGETS[@]}" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
+        _escaped_lines=$(printf '%s\n' "${PURGE_SCAN_NAMES[@]}" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
         local pattern
         pattern="($(printf '%s\n' "$_escaped_lines" | sed -e 's/^/^/' -e 's/$/$/' | paste -sd '|' -))"
         local fd_args=(
@@ -1319,7 +1388,7 @@ scan_purge_targets() {
             "--exclude" "Applications"
         )
         local purge_target
-        for purge_target in "${PURGE_TARGETS[@]}"; do
+        for purge_target in "${PURGE_SCAN_NAMES[@]}"; do
             fd_tag_args+=("--exclude" "$purge_target")
         done
 
@@ -1901,6 +1970,20 @@ format_purge_display() {
     fi
     local padding=$((path_width - $(get_display_width "$path")))
     printf '%s%*s %9s | %s' "$path" "$padding" "" "$size" "$(truncate_by_display_width "$artifact" "$artifact_width")"
+}
+
+# Name the review-only rows a non-interactive run left unselected because they
+# need a person. Args: one "path (label)" per review-only row.
+report_held_purge_rows() {
+    [[ $# -gt 0 ]] || return 0
+    local review_text="artifact"
+    [[ $# -ne 1 ]] && review_text="artifacts"
+    echo ""
+    echo -e "${GRAY}Left $# review-only ${review_text} unselected; run mo purge in a terminal to review:${NC}"
+    local row
+    for row in "$@"; do
+        echo -e "  ${GRAY}${row}${NC}"
+    done
 }
 
 # Purge category selector.
@@ -3240,6 +3323,7 @@ clean_project_artifacts() {
     local -a item_activity_states=()
     local -a item_age_labels=()
     local -a item_cloud_flags=()
+    local -a item_review_flags=()
     local -a item_expected_parents=()
     local -a item_expected_parent_ids=()
     local -a item_expected_target_ids=()
@@ -3323,6 +3407,11 @@ clean_project_artifacts() {
 
         local is_recent="${safe_recent_flags[$item_index]:-true}"
         local activity_state="${safe_activity_states[$item_index]:-uncertain}"
+        local is_review=false
+        is_purge_review_target "${item##*/}" && is_review=true
+        # The recent flag is what keeps a row out of the default selection,
+        # in the menu and under --yes alike.
+        [[ "$is_review" != "true" ]] || is_recent=true
         local is_cloud=false
         if mole_purge_is_cloud_synced_path "$item"; then
             is_cloud=true
@@ -3344,6 +3433,7 @@ clean_project_artifacts() {
         item_recent_flags+=("$is_recent")
         item_activity_states+=("$activity_state")
         item_cloud_flags+=("$is_cloud")
+        item_review_flags+=("$is_review")
         item_expected_parents+=("${safe_expected_parents[$item_index]}")
         item_expected_parent_ids+=("${safe_expected_parent_ids[$item_index]}")
         item_expected_target_ids+=("${safe_expected_target_ids[$item_index]}")
@@ -3354,7 +3444,9 @@ clean_project_artifacts() {
         [[ "$_mod_time" =~ ^[0-9]+$ ]] || _mod_time=$(get_file_mtime "$item" 2> /dev/null || echo "0")
         _age_secs=$((_now_epoch - _mod_time))
         _age_d=$((_age_secs / 86400))
-        if [[ "$activity_state" == "uncertain" ]]; then
+        if [[ "$is_review" == "true" ]]; then
+            item_age_labels+=("$(purge_review_target_label "${item##*/}")")
+        elif [[ "$activity_state" == "uncertain" ]]; then
             item_age_labels+=("unknown")
         elif [[ "$activity_state" == "recent" && $_age_d -ge $MIN_AGE_DAYS ]]; then
             item_age_labels+=("<${MIN_AGE_DAYS}d")
@@ -3447,6 +3539,7 @@ clean_project_artifacts() {
         local -a sorted_item_project_paths=()
         local -a sorted_item_age_labels=()
         local -a sorted_item_cloud_flags=()
+        local -a sorted_item_review_flags=()
         local -a sorted_item_expected_parents=()
         local -a sorted_item_expected_parent_ids=()
         local -a sorted_item_expected_target_ids=()
@@ -3464,6 +3557,7 @@ clean_project_artifacts() {
             sorted_item_project_paths+=("${item_project_paths[idx]}")
             sorted_item_age_labels+=("${item_age_labels[idx]}")
             sorted_item_cloud_flags+=("${item_cloud_flags[idx]}")
+            sorted_item_review_flags+=("${item_review_flags[idx]}")
             sorted_item_expected_parents+=("${item_expected_parents[idx]}")
             sorted_item_expected_parent_ids+=("${item_expected_parent_ids[idx]}")
             sorted_item_expected_target_ids+=("${item_expected_target_ids[idx]}")
@@ -3482,6 +3576,7 @@ clean_project_artifacts() {
         item_project_paths=("${sorted_item_project_paths[@]}")
         item_age_labels=("${sorted_item_age_labels[@]}")
         item_cloud_flags=("${sorted_item_cloud_flags[@]}")
+        item_review_flags=("${sorted_item_review_flags[@]}")
         item_expected_parents=("${sorted_item_expected_parents[@]}")
         item_expected_parent_ids=("${sorted_item_expected_parent_ids[@]}")
         item_expected_target_ids=("${sorted_item_expected_target_ids[@]}")
@@ -3536,9 +3631,15 @@ clean_project_artifacts() {
             return 0
         fi
     else
-        # Non-interactive: select all non-recent items
+        # Non-interactive: select all non-recent items. Review-only rows always
+        # need a person, even under --yes or in a dry run.
         local skipped_cloud_count=0
+        local -a held_review_rows=()
         for ((i = 0; i < ${#menu_options[@]}; i++)); do
+            if [[ "${item_review_flags[i]:-true}" == "true" ]]; then
+                held_review_rows+=("${item_display_paths[i]} (${item_age_labels[i]})")
+                continue
+            fi
             if [[ "${item_cloud_flags[i]:-false}" == "true" && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
                 skipped_cloud_count=$((skipped_cloud_count + 1))
                 continue
@@ -3554,6 +3655,7 @@ clean_project_artifacts() {
             echo ""
             echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped ${skipped_cloud_count} cloud-synced ${skipped_cloud_text} in non-interactive mode (confirmation required)"
         fi
+        report_held_purge_rows "${held_review_rows[@]+"${held_review_rows[@]}"}"
     fi
     if [[ -z "$PURGE_SELECTION_RESULT" ]]; then
         echo ""

@@ -50,6 +50,34 @@ readonly MOLE_PURGE_TARGETS=(
     ".cxx"              # React Native Android NDK build cache
     ".expo"             # Expo
     ".build"            # Swift Package Manager
+    ".swc"              # SWC compiler plugin cache
+)
+
+# Rebuildable in the common case, but they can hold the only copy of local
+# state: .terraform may carry a legacy local backend's state and local module
+# checkouts, .playwright-mcp keeps snapshots and logs a user may have saved.
+# Purge lists them for review and never selects them by itself, not even under
+# --yes. Inside a Git work tree a row needs Git to ignore the directory. They
+# are no quick-hint candidates and never project containers. .wrangler stays
+# out: its state/ holds Miniflare's local D1, KV and R2 data.
+readonly MOLE_PURGE_REVIEW_TARGETS=(
+    ".terraform"
+    ".playwright-mcp"
+)
+
+# A venv/.venv is purgeable only beside one of these in its own directory, so
+# the environment can be rebuilt. requirements*.txt is matched separately.
+readonly MOLE_PURGE_PYTHON_MANIFESTS=(
+    "pyproject.toml"
+    "setup.py"
+    "setup.cfg"
+    "Pipfile"
+    "Pipfile.lock"
+    "uv.lock"
+    "poetry.lock"
+    "pdm.lock"
+    "environment.yml"
+    "environment.yaml"
 )
 
 readonly MOLE_PURGE_DEFAULT_SEARCH_PATHS=(
@@ -221,19 +249,14 @@ mole_git_selected_developer_dir() {
     MOLE_GIT_SELECTED_DEVELOPER_DIR="$answer"
 }
 
-# Run a bounded `git ls-files` in a repository from directory $3. Inherited Git
-# routing and pathspec switches are ignored so the repository's own index
-# answers and fsmonitor hooks never run. Callers name a path with
-# mole_git_path_spec; a bare name would be read as a glob. Returns git's or the
-# timeout's status.
-mole_git_ls_files() {
-    local repo="$1"
-    local deadline="$2"
-    local dir="$3"
-    shift 3
-    local probe_timeout=""
-    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 124
-    local git_bin developer_dir
+# Resolve a usable git executable into MOLE_RESOLVED_GIT_BIN without letting
+# the Apple /usr/bin/git shim open the Command Line Tools installer dialog.
+# The shim's developer directory comes from mole_git_selected_developer_dir,
+# so every probe in a shell reuses one xcode-select answer.
+_mole_resolve_git_bin() {
+    local deadline="$1"
+    local git_bin="" developer_dir=""
+    MOLE_RESOLVED_GIT_BIN=""
     git_bin=$(command -v git) || return 2
     if [[ "$git_bin" == /usr/bin/git || "$git_bin" -ef /usr/bin/git ]]; then
         # The Apple shim opens the CLT installer when tools are absent. Resolve
@@ -246,13 +269,30 @@ mole_git_ls_files() {
         [[ "$developer_dir" != *.app ]] || developer_dir="$developer_dir/Contents/Developer"
         git_bin="$developer_dir/usr/bin/git"
         [[ "$developer_dir" == /* && -x "$git_bin" && ! -L "$git_bin" ]] || return 2
-        probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 124
     fi
+    MOLE_RESOLVED_GIT_BIN="$git_bin"
+}
+
+# Run a bounded `git ls-files` in a repository from directory $3. Inherited Git
+# routing and pathspec switches are ignored so the repository's own index
+# answers and fsmonitor hooks never run. Callers name a path with
+# mole_git_path_spec; a bare name would be read as a glob. Returns git's or the
+# timeout's status.
+mole_git_ls_files() {
+    local repo="$1"
+    local deadline="$2"
+    local dir="$3"
+    shift 3
+    _mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline" > /dev/null || return 124
+    local MOLE_RESOLVED_GIT_BIN=""
+    _mole_resolve_git_bin "$deadline" || return $?
+    local probe_timeout=""
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 124
     run_with_timeout "$probe_timeout" \
         env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
         -u GIT_LITERAL_PATHSPECS -u GIT_GLOB_PATHSPECS -u GIT_NOGLOB_PATHSPECS -u GIT_ICASE_PATHSPECS \
         GIT_OPTIONAL_LOCKS=0 \
-        "$git_bin" -c core.fsmonitor=false --git-dir="$repo/.git" --work-tree="$repo" -C "$dir" ls-files "$@" 2> /dev/null
+        "$MOLE_RESOLVED_GIT_BIN" -c core.fsmonitor=false --git-dir="$repo/.git" --work-tree="$repo" -C "$dir" ls-files "$@" 2> /dev/null
 }
 
 # The pathspec for a physical path inside repository $1, set in
@@ -268,6 +308,28 @@ mole_git_path_spec() {
     local rel=""
     [[ "$path" == "$repo" ]] || rel="${path#"$repo"/}"
     MOLE_GIT_PATH_SPEC=":(top,literal,icase)$rel"
+}
+
+# Bounded `git check-ignore -q` for one physical path $3, asked from its parent
+# with the same routing and fsmonitor isolation as mole_git_ls_files.
+# check-ignore rejects the literal pathspec magic, so the basename goes after
+# `--` instead; callers pass only fixed artifact names. Returns 0 ignored,
+# 1 not ignored, otherwise git's or the timeout's status.
+mole_git_check_ignore() {
+    local repo="$1"
+    local deadline="$2"
+    local path="${3%/}"
+    _mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline" > /dev/null || return 124
+    local MOLE_RESOLVED_GIT_BIN=""
+    _mole_resolve_git_bin "$deadline" || return $?
+    local probe_timeout=""
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 124
+    run_with_timeout "$probe_timeout" \
+        env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+        -u GIT_LITERAL_PATHSPECS -u GIT_GLOB_PATHSPECS -u GIT_NOGLOB_PATHSPECS -u GIT_ICASE_PATHSPECS \
+        GIT_OPTIONAL_LOCKS=0 \
+        "$MOLE_RESOLVED_GIT_BIN" -c core.fsmonitor=false --git-dir="$repo/.git" --work-tree="$repo" -C "${path%/*}" \
+        check-ignore -q -- "${path##*/}" 2> /dev/null
 }
 
 # Whether Git tracks files below a directory, asked of the repository that owns
