@@ -727,6 +727,21 @@ EOF
     [[ "$output" == *"valid=/var/folders/example/C relative=1 traversal=1 root=1 timeout=124"* ]]
 }
 
+@test "mole_darwin_user_temp_root asks getconf for the per-user temp dir" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+run_with_timeout() {
+    [[ "$2" == "/usr/bin/getconf" && "$3" == "DARWIN_USER_TEMP_DIR" ]] || return 3
+    printf '/var/folders/example/T/\n'
+}
+mole_darwin_user_temp_root
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = "/var/folders/example/T" ]
+}
+
 @test "mole_go_cache_root validates owner output and propagates timeout" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail

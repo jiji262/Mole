@@ -2782,6 +2782,72 @@ EOF
     [ -d "$outside_root/private-data" ]
 }
 
+@test "pytest cleanup removes finished temp runs and keeps locked and linked entries" {
+    local darwin_temp="$HOME/darwin-temp"
+    local run_root="$darwin_temp/pytest-of-tester"
+    local outside_root="$HOME/outside-pytest"
+    mkdir -p "$run_root/pytest-1/test_a0" "$run_root/pytest-2" "$run_root/pytest-notes" \
+        "$outside_root/private-data"
+    printf '4242' > "$run_root/pytest-2/.lock"
+    ln -s "$run_root/pytest-2" "$run_root/pytest-current"
+    ln -s "$outside_root" "$run_root/pytest-3"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DARWIN_TEMP="$darwin_temp" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_darwin_user_temp_root() { printf '%s\n' "$DARWIN_TEMP"; }
+pytest_process_state() { return 1; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        printf 'CLEAN=%s|%s\n' "$description" "$1"
+        shift
+    done
+}
+clean_pytest_basetemp
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN=Pytest temp runs|$run_root/pytest-1"* ]] || return 1
+    [[ "$output" != *"$run_root/pytest-2"* ]] || return 1
+    [[ "$output" != *"pytest-current"* ]] || return 1
+    [[ "$output" != *"pytest-3"* ]] || return 1
+    [[ "$output" != *"pytest-notes"* ]] || return 1
+    [ -d "$outside_root/private-data" ]
+}
+
+@test "pytest cleanup defers while pytest runs and stops on an unknown process state" {
+    local darwin_temp="$HOME/darwin-temp-busy"
+    mkdir -p "$darwin_temp/pytest-of-tester/pytest-1"
+
+    local state
+    for state in 0 2; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DARWIN_TEMP="$darwin_temp" \
+            PROBE_STATE="$state" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_darwin_user_temp_root() { printf '%s\n' "$DARWIN_TEMP"; }
+pytest_process_state() { return "$PROBE_STATE"; }
+defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_pytest_basetemp
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || return 1
+        if [[ $state -eq 0 ]]; then
+            [[ "$output" == *"DEFER=pytest"* ]] || return 1
+        else
+            [[ "$output" == *"Pytest temp runs · stopped (process state unknown)"* ]] || return 1
+        fi
+    done
+    [ -d "$darwin_temp/pytest-of-tester/pytest-1" ]
+}
+
 @test "clean_dev_rust honors CARGO_HOME and RUSTUP_HOME when absolute" {
     # mise and friends relocate cargo/rustup via env; hardcoded ~/.cargo misses
     # the live cache (issue #1378). Scope stays redundant download copies only.

@@ -241,15 +241,21 @@ mole_github_cli_cache_root() {
     printf '%s\n' "$cache_root"
 }
 
-# Resolve the per-user cache root reported by macOS. Keep the resolver shared
-# so cleanup and whitelist inventory always describe the same path.
-mole_darwin_user_cache_root() {
+# Resolve a per-user directory reported by macOS (DARWIN_USER_CACHE_DIR or
+# DARWIN_USER_TEMP_DIR). Keep the resolver shared so cleanup and whitelist
+# inventory always describe the same path.
+_mole_darwin_user_dir_root() {
+    local dir_key="$1"
+    case "$dir_key" in
+        DARWIN_USER_CACHE_DIR | DARWIN_USER_TEMP_DIR) ;;
+        *) return 1 ;;
+    esac
     declare -f run_with_timeout > /dev/null 2>&1 || return 1
 
     local cache_root=""
     local resolver_rc=0
     cache_root=$(run_with_timeout "${MOLE_TIMEOUT_QUICK_DETECT_SEC:-3}" \
-        /usr/bin/getconf DARWIN_USER_CACHE_DIR 2> /dev/null) || resolver_rc=$?
+        /usr/bin/getconf "$dir_key" 2> /dev/null) || resolver_rc=$?
     [[ $resolver_rc -eq 0 ]] || return "$resolver_rc"
 
     [[ "$cache_root" == /* && ! "$cache_root" =~ [[:cntrl:]] ]] || return 1
@@ -265,6 +271,14 @@ mole_darwin_user_cache_root() {
     esac
 
     printf '%s\n' "$cache_root"
+}
+
+mole_darwin_user_cache_root() {
+    _mole_darwin_user_dir_root DARWIN_USER_CACHE_DIR
+}
+
+mole_darwin_user_temp_root() {
+    _mole_darwin_user_dir_root DARWIN_USER_TEMP_DIR
 }
 
 # Resolve the effective Go cache roots through the Go tool itself. Cleanup and

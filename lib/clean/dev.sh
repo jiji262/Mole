@@ -951,6 +951,48 @@ clean_clang_module_cache() {
         "${candidates[@]}"
 }
 
+pytest_process_state() {
+    mole_pgrep_any -f "[p]y\.?test"
+}
+
+# pytest keeps each session's tmp_path tree in <temp>/pytest-of-<user>/pytest-<N>
+# and holds <N>/.lock while that session runs; a finished run is scratch that
+# pytest itself prunes down to the newest three. Locked runs stay. A run with
+# tmp_path_retention_count = 0 has no lock, so the process probe gates every
+# removal too. pytest-current and other symlinks are never candidates.
+clean_pytest_basetemp() {
+    local temp_root=""
+    local resolver_rc=0
+    temp_root=$(mole_darwin_user_temp_root) || resolver_rc=$?
+    if [[ $resolver_rc -ne 0 ]]; then
+        mole_rc_timeout_or_signal "$resolver_rc" && return "$resolver_rc"
+        return 0
+    fi
+
+    local run_root candidate
+    local -a candidates=()
+    for run_root in "$temp_root"/pytest-of-*; do
+        [[ -d "$run_root" && ! -L "$run_root" && -O "$run_root" ]] || continue
+        candidates=()
+        for candidate in "$run_root"/pytest-[0-9]*; do
+            [[ "${candidate##*/pytest-}" =~ ^[0-9]+$ ]] || continue
+            [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+            [[ ! -e "$candidate/.lock" && ! -L "$candidate/.lock" ]] || continue
+            candidates+=("$candidate")
+        done
+        [[ ${#candidates[@]} -gt 0 ]] || continue
+
+        clean_guarded_dev_cache_root \
+            "$temp_root" \
+            "$run_root" \
+            pytest_process_state \
+            "pytest" \
+            "Pytest temp runs" \
+            "${candidates[@]}" || return $?
+    done
+    return 0
+}
+
 # Python/pip ecosystem caches.
 clean_dev_python() {
     # Check pip3 is functional (not just macOS stub that triggers CLT install dialog)
@@ -977,6 +1019,7 @@ clean_dev_python() {
     safe_clean ~/.cache/ruff/* "Ruff cache"
     safe_clean ~/.cache/mypy/* "MyPy cache"
     safe_clean ~/.pytest_cache/* "Pytest cache"
+    clean_pytest_basetemp || return $?
     clean_pyinstaller_bincache
     safe_clean ~/.jupyter/runtime/* "Jupyter runtime cache"
     # Hugging Face, PyTorch, TensorFlow and Weights & Biases keep downloaded
