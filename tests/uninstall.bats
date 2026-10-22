@@ -2360,10 +2360,10 @@ EOF
 @test "batch_uninstall_applications keeps name-keyed leftovers when sibling installs share a display name" {
     local fixture_home
     fixture_home=$(mktemp -d "$HOME/inventory-fixture.XXXXXX")
-    # On unindexed volumes mdls returns (null) and CFBundleName collapses both
-    # installs to one display name ("Xcode" for Xcode-beta.app). Discovery must
-    # fall back to the .app basename; when even that collides with the
-    # survivor, name cleanup and login-item removal must be suppressed.
+    # Same-bundle installs can still share one display name when both localize
+    # to the same InfoPlist.strings name. Discovery must fall back to the .app
+    # basename; when even that collides with the survivor, name cleanup and
+    # login-item removal must be suppressed.
     mkdir -p "$fixture_home/Applications/SharedName-beta.app" "$fixture_home/Applications/SharedName.app"
     mkdir -p "$fixture_home/OtherApps/SharedName.app"
     mkdir -p "$fixture_home/Library/Application Support/SharedName"
@@ -3724,26 +3724,29 @@ PLIST
 }
 
 _run_display_name_case() {
-    local languages="$1" app_path="$2" app_name="$3"
+    local languages="$1" app_path="$2" app_name="$3" mdls_mode="${4:-answers}"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" LANGS="$languages" \
-        APP_PATH="$app_path" APP_NAME="$app_name" \
+        APP_PATH="$app_path" APP_NAME="$app_name" MDLS_MODE="$mdls_mode" \
         /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
-# bin/uninstall.sh freezes these as readonly while it is sourced: the user's
-# locale before it forces C, the mdls budget, and the language list it reads
-# from `defaults`. Feed each one where the script reads it.
+# bin/uninstall.sh freezes the language list it reads from `defaults` as
+# readonly while it is sourced, so feed it there; start without a locale so no
+# host setting reaches the case.
 unset LC_ALL LANG
-export MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC=3
 defaults() { [[ -z "$LANGS" ]] || printf '%s\n' "$LANGS"; }
 source "$PROJECT_ROOT/bin/uninstall.sh"
 [[ "$MOLE_UNINSTALL_PREFERRED_LANGS" == "$LANGS" ]] || { echo "LANGS_NOT_APPLIED"; exit 1; }
 
-# mdls only ever reports the on-disk file name for an app bundle, which is the
-# string this behavior exists to replace. Stub it so the case cannot pass by
-# accidentally agreeing with Spotlight.
+# mdls answers a display-name query only sometimes inside a scan's probe
+# budget, and for an unlocalized bundle it echoes the file name. Stub both
+# outcomes so a case cannot pass by agreeing with whichever one Spotlight
+# happened to give (#1791).
 run_with_timeout() {
     shift
+    if [[ "$MDLS_MODE" == "times-out" && " $* " == *" mdls "* ]]; then
+        return 124
+    fi
     "$@"
 }
 mdls() { printf '%s\n' "$(basename "$APP_PATH")"; }
@@ -3757,11 +3760,11 @@ EOF
     _write_display_name_fixture "$app_path" "en" "VideoFusion-macOS" \
         "en=VideoFusion" "zh-Hans=剪映专业版"
 
-    _run_display_name_case "$(printf 'zh-Hans-CN\nen-CN')" "$app_path" "VideoFusion-macOS.app"
+    _run_display_name_case "$(printf 'zh-Hans-CN\nen-CN')" "$app_path" "VideoFusion-macOS"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [ "$output" = "剪映专业版" ] || { echo "$output"; return 1; }
 
-    _run_display_name_case "$(printf 'en-CN\nzh-Hans-CN')" "$app_path" "VideoFusion-macOS.app"
+    _run_display_name_case "$(printf 'en-CN\nzh-Hans-CN')" "$app_path" "VideoFusion-macOS"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [ "$output" = "VideoFusion" ] || { echo "$output"; return 1; }
 }
@@ -3773,60 +3776,52 @@ EOF
     local app_path="$HOME/Applications/MiaoYan.app"
     _write_display_name_fixture "$app_path" "en" "MiaoYan" "Base=-" "zh-Hans=妙言"
 
-    _run_display_name_case "$(printf 'en-CN\nzh-Hans-CN')" "$app_path" "MiaoYan.app"
+    _run_display_name_case "$(printf 'en-CN\nzh-Hans-CN')" "$app_path" "MiaoYan"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [ "$output" = "MiaoYan" ] || { echo "$output"; return 1; }
 
-    _run_display_name_case "$(printf 'zh-Hans-CN\nen-CN')" "$app_path" "MiaoYan.app"
+    _run_display_name_case "$(printf 'zh-Hans-CN\nen-CN')" "$app_path" "MiaoYan"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [ "$output" = "妙言" ] || { echo "$output"; return 1; }
 }
 
+# Without a language list nothing is localized, and Finder shows the file name
+# even when Info.plist carries a different CFBundleDisplayName
+# (NSFileManager.displayName reports "NoPrefs" for this fixture).
 @test "uninstall_resolve_display_name keeps the unlocalized name without a language list (#1520)" {
     local app_path="$HOME/Applications/NoPrefs.app"
     _write_display_name_fixture "$app_path" "en" "NoPrefs Base" "zh-Hans=中文名"
 
-    _run_display_name_case "" "$app_path" "NoPrefs.app"
+    _run_display_name_case "" "$app_path" "NoPrefs"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    [ "$output" = "NoPrefs Base" ] || { echo "$output"; return 1; }
+    [ "$output" = "NoPrefs" ] || { echo "$output"; return 1; }
 }
 
+# Finder names a bundle it cannot localize by its file name. mdls echoes that
+# file name, but only when it answers inside the scan's probe budget; a missed
+# probe used to fall through to CFBundleName, so Visual Studio Code.app listed
+# as "Code" on one scan and "Visual Studio Code" on the next (#1791).
+@test "uninstall_resolve_display_name names an unlocalized bundle by its file name whether or not mdls answers (#1791)" {
+    local app_path="$HOME/Applications/Visual Studio Code.app"
+    _write_display_name_fixture "$app_path" "en" "Code"
+
+    local mdls_mode
+    for mdls_mode in answers times-out; do
+        _run_display_name_case "en-CN" "$app_path" "Visual Studio Code" "$mdls_mode"
+        [ "$status" -eq 0 ] || { echo "$mdls_mode: $output"; return 1; }
+        [ "$output" = "Visual Studio Code" ] || { echo "$mdls_mode: $output"; return 1; }
+    done
+}
+
+# A copy kept beside the current Xcode still localizes to the generic "Xcode";
+# the version in its file name is what tells the two installs apart.
 @test "uninstall_resolve_display_name keeps versioned app names when metadata is generic" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
-set -euo pipefail
-# bin/uninstall.sh freezes the user's locale and language list as readonly
-# while it is sourced; start both empty so no host setting reaches the case.
-unset LC_ALL LANG
-defaults() { return 1; }
-source "$PROJECT_ROOT/bin/uninstall.sh"
-[[ -z "$MOLE_UNINSTALL_PREFERRED_LANGS" ]] || { echo "HOST_LANGS_LEAKED"; exit 1; }
+    local app_path="$HOME/Applications/Xcode 16.4.app"
+    _write_display_name_fixture "$app_path" "en" "Xcode" "en=Xcode"
 
-function run_with_timeout() {
-    shift
-    "$@"
-}
-
-function mdls() {
-    echo "Xcode"
-}
-
-function plutil() {
-    if [[ "$3" == *"Info.plist" ]]; then
-        echo "Xcode"
-        return 0
-    fi
-    return 1
-}
-
-app_path="$HOME/Applications/Xcode 16.4.app"
-mkdir -p "$app_path/Contents"
-touch "$app_path/Contents/Info.plist"
-
-result=$(uninstall_resolve_display_name "$app_path" "Xcode 16.4.app")
-[[ "$result" == "Xcode 16.4" ]] || exit 1
-EOF
-
-    [ "$status" -eq 0 ]
+    _run_display_name_case "en-CN" "$app_path" "Xcode 16.4"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = "Xcode 16.4" ] || { echo "$output"; return 1; }
 }
 
 @test "decode_file_list handles empty input" {

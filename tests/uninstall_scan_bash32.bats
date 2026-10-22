@@ -658,7 +658,6 @@ EOF
 
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
 		MOLE_TEST_NO_AUTH=1 APPS_ROOT="$apps_root" SRC_PATH="$src" \
-		MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC=0 \
 		MOLE_UNINSTALL_INLINE_MDLS_SIZE_TIMEOUT_SEC=0 \
 		/bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -692,7 +691,7 @@ EOF
 		/bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$SRC_PATH"
-[[ "$MOLE_UNINSTALL_META_CACHE_FILE" == */uninstall_app_metadata_v4 ]]
+[[ "$MOLE_UNINSTALL_META_CACHE_FILE" == */uninstall_app_metadata_v5 ]]
 EOF
 
 	[ "$status" -eq 0 ]
@@ -708,7 +707,6 @@ EOF
 
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
 		MOLE_TEST_NO_AUTH=1 APPS_ROOT="$apps_root" SRC_PATH="$src" \
-		MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC=0 \
 		MOLE_UNINSTALL_INLINE_MDLS_SIZE_TIMEOUT_SEC=0 \
 		MOLE_UNINSTALL_INLINE_DU_SIZE_TIMEOUT_SEC=0 \
 		/bin/bash --noprofile --norc <<'EOF'
@@ -741,7 +739,6 @@ EOF
 
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
 		MOLE_TEST_NO_AUTH=1 APPS_ROOT="$apps_root" SRC_PATH="$src" \
-		MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC=0 \
 		MOLE_UNINSTALL_INLINE_MDLS_SIZE_TIMEOUT_SEC=0 \
 		MOLE_UNINSTALL_INLINE_DU_SIZE_TIMEOUT_SEC=0 \
 		MOLE_UNINSTALL_INLINE_DU_MAX_COLD_ROWS=0 \
@@ -896,7 +893,9 @@ EOF
 	[[ "$output" == *"|$live_app|Aegis|com.example.Aegis|"* ]] || return 1
 	[[ "$output" != *"|$backup_one|"* ]] || return 1
 	[[ "$output" != *"|$backup_two|"* ]] || return 1
-	[[ "$output" == *"|$lone_hidden|Solo|com.example.Solo|"* ]]
+	# An unlocalized bundle keeps its file name, the name Finder shows, so the
+	# lone hidden app lists as ".Solo" rather than its CFBundleName.
+	[[ "$output" == *"|$lone_hidden|.Solo|com.example.Solo|"* ]]
 }
 
 @test "scan_applications keeps distinct installs sharing a bundle id (Xcode vs Xcode-beta)" {

@@ -12,10 +12,6 @@ if [[ "$EUID" -eq 0 ]]; then
     exit 1
 fi
 
-# Preserve user's locale for app display name lookup.
-readonly MOLE_UNINSTALL_USER_LC_ALL="${LC_ALL:-}"
-readonly MOLE_UNINSTALL_USER_LANG="${LANG:-}"
-
 # Fix locale issues on non-English systems.
 export LC_ALL=C
 export LANG=C
@@ -40,13 +36,12 @@ files_cleaned=0
 total_size_cleaned=0
 
 readonly MOLE_UNINSTALL_META_CACHE_DIR="$HOME/.cache/mole"
-readonly MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v4"
+readonly MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v5"
 readonly MOLE_UNINSTALL_META_CACHE_LOCK="${MOLE_UNINSTALL_META_CACHE_FILE}.lock"
 readonly MOLE_UNINSTALL_META_REFRESH_TTL=604800 # 7 days
 readonly MOLE_UNINSTALL_EPOCH_FLOOR=978307200
-# Display-name mdls lookup budget during scan; overridable for slow disks or
+# Physical-size mdls lookup budget during scan; overridable for slow disks or
 # cold Spotlight.
-readonly MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC="${MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC:-0.04}"
 readonly MOLE_UNINSTALL_INLINE_MDLS_SIZE_TIMEOUT_SEC="${MOLE_UNINSTALL_INLINE_MDLS_SIZE_TIMEOUT_SEC:-0.04}"
 # Bounded inline du fallback for cold rows whose quick mdls probe missed
 # (new apps are often not yet Spotlight-indexed). Only enabled when the
@@ -231,48 +226,16 @@ uninstall_resolve_display_name() {
         fi
         [[ -n "$playcover_name" && "$playcover_name" != "(null)" ]] && display_name="$playcover_name"
     elif [[ -f "$app_path/Contents/Info.plist" ]]; then
-        # The bundle's own localized name is what Finder shows, so it wins and
-        # spares the mdls fork. mdls only ever reports the on-disk file name for
-        # an app bundle, which is exactly the unrecognizable string this avoids.
+        # Finder shows the bundle's localized name, and without one the file
+        # name already in app_name, even when Info.plist carries a different
+        # CFBundleDisplayName or CFBundleName. mdls is not asked: it answered
+        # only sometimes inside the scan's probe budget, and a miss fell
+        # through to CFBundleName, so one app listed under two names across
+        # scans (#1791).
         local localized_name
         localized_name=$(_uninstall_localized_bundle_name "$app_path")
-
-        local md_display_name=""
-        if [[ -n "$localized_name" ]]; then
-            :
-        elif [[ -n "$MOLE_UNINSTALL_USER_LC_ALL" ]]; then
-            md_display_name=$(run_with_timeout "$MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC" env LC_ALL="$MOLE_UNINSTALL_USER_LC_ALL" LANG="$MOLE_UNINSTALL_USER_LANG" mdls -name kMDItemDisplayName -raw "$app_path" 2> /dev/null || echo "")
-        elif [[ -n "$MOLE_UNINSTALL_USER_LANG" ]]; then
-            md_display_name=$(run_with_timeout "$MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC" env LANG="$MOLE_UNINSTALL_USER_LANG" mdls -name kMDItemDisplayName -raw "$app_path" 2> /dev/null || echo "")
-        else
-            md_display_name=$(run_with_timeout "$MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC" mdls -name kMDItemDisplayName -raw "$app_path" 2> /dev/null || echo "")
-        fi
-
-        local bundle_display_name
-        bundle_display_name=$(plutil -extract CFBundleDisplayName raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
-        local bundle_name
-        bundle_name=$(plutil -extract CFBundleName raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
-
-        if [[ "$md_display_name" == /* ]]; then
-            md_display_name=""
-        fi
-        md_display_name="${md_display_name//|/-}"
-        md_display_name="${md_display_name//[$'\t\r\n']/}"
-
-        bundle_display_name="${bundle_display_name//|/-}"
-        bundle_display_name="${bundle_display_name//[$'\t\r\n']/}"
-
-        bundle_name="${bundle_name//|/-}"
-        bundle_name="${bundle_name//[$'\t\r\n']/}"
-
         if [[ -n "$localized_name" ]]; then
             display_name="$localized_name"
-        elif [[ -n "$md_display_name" && "$md_display_name" != "(null)" && "$md_display_name" != "$app_name" ]]; then
-            display_name="$md_display_name"
-        elif [[ -n "$bundle_display_name" && "$bundle_display_name" != "(null)" ]]; then
-            display_name="$bundle_display_name"
-        elif [[ -n "$bundle_name" && "$bundle_name" != "(null)" ]]; then
-            display_name="$bundle_name"
         fi
     fi
 
