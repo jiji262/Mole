@@ -179,6 +179,7 @@ _defer_app_cache_guard_family() {
     case "$1" in
         _simulator_app_cache_delete_guard_allows | _simulator_device_leaf_delete_guard_allows) mole_defer_cleanup_family "Simulator" ;;
         _autodesk_cache_delete_guard_allows) mole_defer_cleanup_family "Autodesk" ;;
+        _futu_update_delete_guard_allows) mole_defer_cleanup_family "Futu" ;;
         *) mole_defer_cleanup_family "Xcode" ;;
     esac
 }
@@ -2268,11 +2269,9 @@ clean_futu_update_downloads() {
         return 0
     fi
     local guarded_rc=0
-    safe_clean_guarded _futu_update_delete_guard_allows "$root"/* "Futu update downloads" || guarded_rc=$?
-    if [[ $guarded_rc -eq 75 ]]; then
-        mole_report_guard_stop "Futu update downloads" mole_defer_cleanup_family "Futu"
-        return 0
-    fi
+    _app_cache_safe_clean_guarded _futu_update_delete_guard_allows \
+        "Futu update downloads" "$root"/* "Futu update downloads" || guarded_rc=$?
+    [[ $guarded_rc -eq 1 ]] && return 0
     return "$guarded_rc"
 }
 
