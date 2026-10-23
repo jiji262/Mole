@@ -6548,7 +6548,11 @@ EOF
 }
 
 @test "purge offers .playwright-mcp outside git unselected" {
-    local outside="$BATS_TEST_TMPDIR/outside-git"
+    # fd --absolute-path canonicalizes its search root, so under /var (a link
+    # to /private/var) it prints a different spelling than find. Root the
+    # fixture at the physical temp dir so either scanner reports one path.
+    local outside
+    outside="$(cd "$BATS_TEST_TMPDIR" && /bin/pwd -P)/outside-git"
     mkdir -p "$outside/web/.playwright-mcp" "$outside/web/node_modules"
     touch "$outside/web/package.json" "$outside/web/package-lock.json" \
         "$outside/web/node_modules/.package-lock.json"
@@ -6563,6 +6567,7 @@ source "$PROJECT_ROOT/lib/clean/project.sh"
 mole_find_git_repo_root "$OUTSIDE/web" && { echo "FIXTURE_IN_GIT:$MOLE_GIT_REPO_ROOT"; exit 1; }
 mkdir -p "$HOME/.cache/mole"
 PURGE_SEARCH_PATHS=("$OUTSIDE")
+purge_artifact_in_use() { return 1; }
 get_dir_size_kb() { echo 4; }
 safe_remove() { printf 'REMOVE:%s\n' "$1"; }
 export MOLE_DRY_RUN=1
