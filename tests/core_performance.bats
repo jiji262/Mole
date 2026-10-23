@@ -178,38 +178,42 @@ EOF
     local test_file="$TEST_DATA_DIR/size_test.txt"
     dd if=/dev/zero of="$test_file" bs=1024 count=100 2> /dev/null
 
-    # 500 calls, compared with the same count of the one stat probe that
-    # get_file_size performs. A regression that adds one fork per call raises
-    # the measured cost far above this ratio; absolute milliseconds would be a
-    # machine-speed lottery. Measured here: get_file_size ~1.2s, stat reference
-    # ~1.18s (ratio ~1.02); one extra fork per call adds ~0.5s.
+    # get_file_size performs one stat probe, so compare it with that probe
+    # alone; absolute milliseconds would be a machine-speed lottery. One added
+    # fork+exec per call measured 161-181% of the reference here, the unchanged
+    # function 94-113%. A single 500-call timing of each side swung from 50%
+    # to 154% on a loaded Mac and failed CI repeatedly, so alternate ten
+    # 50-call rounds and judge the median per-round ratio: both halves of a
+    # round share the same load, and the median ignores a spike either way.
     local ratio_percent="${MOLE_PERF_GET_FILE_SIZE_RATIO_PERCENT:-125}"
-    local get_ms ref_ms
-    read -r get_ms ref_ms <<< "$(
+    local median_percent
+    median_percent="$(
         /bin/bash --noprofile --norc -c '
             source "$1/lib/core/base.sh"
             file="$2"
             get_file_size "$file" > /dev/null
-            start=$(date +%s%N)
-            for i in {1..500}; do
-                get_file_size "$file" > /dev/null
-            done
-            end=$(date +%s%N)
-            get_ms=$(( (end - start) / 1000000 ))
-            start=$(date +%s%N)
-            for i in {1..500}; do
-                value=$($STAT_BSD -f%z "$file" 2> /dev/null)
-            done
-            end=$(date +%s%N)
-            ref_ms=$(( (end - start) / 1000000 ))
-            printf "%s %s\n" "$get_ms" "$ref_ms"
+            for round in 1 2 3 4 5 6 7 8 9 10; do
+                start=$(date +%s%N)
+                for i in {1..50}; do
+                    get_file_size "$file" > /dev/null
+                done
+                mid=$(date +%s%N)
+                for i in {1..50}; do
+                    value=$($STAT_BSD -f%z "$file" 2> /dev/null)
+                done
+                end=$(date +%s%N)
+                echo $(( (mid - start) * 100 / (end - mid) ))
+            done | sort -n | sed -n "5p;6p" | {
+                read -r low
+                read -r high
+                echo $(( (low + high) / 2 ))
+            }
         ' _ "$PROJECT_ROOT" "$test_file"
     )"
 
-    local limit_ms=$(( ref_ms * ratio_percent / 100 + 150 ))
-    if [[ "$get_ms" -ge "$limit_ms" ]]; then
-        printf 'get_file_size %sms vs stat reference %sms (limit %sms)\n' \
-            "$get_ms" "$ref_ms" "$limit_ms" >&2
+    if [[ ! "$median_percent" =~ ^[0-9]+$ || "$median_percent" -ge "$ratio_percent" ]]; then
+        printf 'get_file_size median %s%% of the stat reference (limit %s%%)\n' \
+            "$median_percent" "$ratio_percent" >&2
         return 1
     fi
 }
