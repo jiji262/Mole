@@ -5321,7 +5321,11 @@ EOF
 
 @test "purge offers .playwright-mcp outside git unselected" {
     _purge_fake_idle_lsof
-    local outside="$BATS_TEST_TMPDIR/outside-git"
+    # fd --absolute-path canonicalizes its search root, so under /var (a link
+    # to /private/var) it prints a different spelling than find. Root the
+    # fixture at the physical temp dir so either scanner reports one path.
+    local outside
+    outside="$(cd "$BATS_TEST_TMPDIR" && /bin/pwd -P)/outside-git"
     mkdir -p "$outside/web/.playwright-mcp" "$outside/web/node_modules"
     touch "$outside/web/package.json"
     printf 'x\n' > "$outside/web/.playwright-mcp/page.yml"
