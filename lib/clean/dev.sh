@@ -7,6 +7,8 @@ _mole_dev_module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_mole_dev_module_dir/ai_cli_state.sh"
 # Chromium-fork, automation-profile and dot-dir cache leaves, from clean_dev_misc.
 source "$_mole_dev_module_dir/fork_app_caches.sh"
+# Merged, clean, idle AI agent worktrees, from clean_dev_misc.
+source "$_mole_dev_module_dir/agent_worktrees.sh"
 
 # Owner commands follow configured roots, so lexical policy alone cannot
 # protect a cache reached through a directory alias. Resolve the existing
@@ -6637,6 +6639,12 @@ clean_dev_misc() {
     # memory, sessions, settings, hooks, plugin registries, marketplaces, and
     # plugin data under ~/.claude stay untouched.
     clean_claude_code_disposable_state
+    # Agent worktrees (Codex app, Claude Code, superpowers) that are merged
+    # into the remote default branch, clean, idle 24h and unreferenced; any
+    # ignored file outside MOLE_PURGE_TARGETS keeps the worktree.
+    if declare -f agent_worktree_containers > /dev/null 2>&1; then
+        clean_merged_agent_worktrees
+    fi
     # Wondershare orphan installer payload (bundle ID differs from live app)
     safe_clean ~/Library/Application\ Support/com.wondershare.Installer/* "Wondershare installer payload"
     # Named cache leaves of Chromium forks and automation profiles, nvm and

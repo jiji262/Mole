@@ -8,7 +8,7 @@
 # or a bare `git init` stub.
 # A probe that cannot answer keeps the target. Everything else under ~/.claude and ~/.codex (projects, memory,
 # sessions, settings, hooks, marketplaces, plugin data, registries, installed
-# versions, worktrees) stays untouched.
+# versions) stays untouched; agent worktrees follow agent_worktrees.sh.
 set -euo pipefail
 
 _AI_CLI_SECONDS_PER_DAY=86400

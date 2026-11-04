@@ -96,7 +96,8 @@ readonly MOLE_PURGE_DEFAULT_SEARCH_PATHS=(
     # is_project_container rejects any basename starting with a dot. Listing
     # the exact containers keeps the checkouts inside them in scope for
     # rebuildable-artifact cleanup without widening discovery to dot
-    # directories in general. The worktrees themselves are never removed.
+    # directories in general. Purge never removes the worktrees themselves;
+    # only clean_merged_agent_worktrees in `mo clean` may, on its evidence.
     "$HOME/.codex/worktrees"
     "$HOME/.claude/worktrees"
     "$HOME/.t3/worktrees"
@@ -254,7 +255,7 @@ mole_git_selected_developer_dir() {
 # The shim's developer directory comes from mole_git_selected_developer_dir,
 # so every probe in a shell reuses one xcode-select answer.
 _mole_resolve_git_bin() {
-    local deadline="$1"
+    local deadline="${1:-}"
     local git_bin="" developer_dir=""
     MOLE_RESOLVED_GIT_BIN=""
     git_bin=$(command -v git) || return 2

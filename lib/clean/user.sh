@@ -3407,16 +3407,30 @@ mole_agent_recorded_repositories() {
     unset -f _mole_agent_record_allowed
 }
 
-# List every agent worktree container once, NUL-separated: the fixed Codex and
-# T3 Code containers first, then each `.claude/worktrees` under the project roots,
+# Project roots searched for agent worktree containers, one per line: the
+# fixed defaults, ~/.config/mole/purge_paths, and (inside `mo clean`) the
+# roots the project-cache section discovers under $HOME, such as ~/codes.
+_agent_worktree_search_roots() {
+    local root
+    for root in "$HOME/code" "$HOME/Code" "$HOME/dev" "$HOME/Projects" \
+        "$HOME/GitHub" "$HOME/Workspace" "$HOME/Repos" \
+        "$HOME/Development" "$HOME/Developer" "$HOME/www" "$HOME/src"; do
+        printf '%s\n' "$root"
+    done
+    mole_purge_read_paths_config "$HOME/.config/mole/purge_paths"
+    if declare -f discover_project_cache_roots > /dev/null 2>&1; then
+        discover_project_cache_roots 2> /dev/null || true
+    fi
+}
+
+# List every agent worktree container once, NUL-separated: the fixed Codex,
+# T3 Code, and Claude Code user containers first, then each `.claude/worktrees`,
+# `.worktrees` (superpowers) or `worktrees` directory under the project roots,
 # then the `.claude/worktrees` and `.codex/worktrees` of every repository Claude
 # Code and Codex record as a project. Containers are told apart by identity.
+# A container is only where to look: clean_merged_agent_worktrees still proves
+# each child is a linked worktree before it is a candidate.
 agent_worktree_containers() {
-    local -a roots=(
-        "$HOME/code" "$HOME/Code" "$HOME/dev" "$HOME/Projects"
-        "$HOME/GitHub" "$HOME/Workspace" "$HOME/Repos"
-        "$HOME/Development" "$HOME/Developer" "$HOME/www" "$HOME/src"
-    )
     local container
     local -a printed_ids=()
     _mole_print_container_once() {
@@ -3428,9 +3442,8 @@ agent_worktree_containers() {
         printed_ids+=("$id")
         printf '%s\0' "$1"
     }
-    # The Codex and T3 Code apps keep every worktree under one fixed container
-    # outside any project root, so the find below never reaches them.
-    for container in "$HOME/.codex/worktrees" "$HOME/.t3/worktrees"; do
+    # These sit outside any project root, so the find below never reaches them.
+    for container in "$HOME/.codex/worktrees" "$HOME/.t3/worktrees" "$HOME/.claude/worktrees"; do
         if [[ -d "$container" && ! -L "$container" ]]; then
             _mole_print_container_once "$container"
         fi
@@ -3440,33 +3453,20 @@ agent_worktree_containers() {
     # may be a symlink to another. Scan each physical root once, or every
     # container is reported twice (same class as #590 and #1416). A root can
     # also sit inside another one, so containers are deduplicated as well.
-    local -a scanned_roots=() listed_containers=()
-    local root physical_root scanned already_scanned
-    for root in "${roots[@]}"; do
-        [[ -d "$root" ]] || continue
+    local -a scanned_roots=()
+    local root physical_root
+    while IFS= read -r root; do
+        [[ -n "$root" && -d "$root" ]] || continue
+        case "$root" in "$HOME/.codex" | "$HOME/.codex/"* | "$HOME/.t3" | "$HOME/.t3/"* | "$HOME/.claude" | "$HOME/.claude/"*) continue ;; esac
         physical_root=$(mole_purge_resolve_path_case "$root")
-        already_scanned=false
-        for scanned in "${scanned_roots[@]+"${scanned_roots[@]}"}"; do
-            if [[ "$scanned" == "$physical_root" ]]; then
-                already_scanned=true
-                break
-            fi
-        done
-        [[ "$already_scanned" == "false" ]] || continue
+        mole_identity_in_list "$physical_root" "${scanned_roots[@]+"${scanned_roots[@]}"}" && continue
         scanned_roots+=("$physical_root")
         while IFS= read -r -d '' container; do
-            already_scanned=false
-            for scanned in "${listed_containers[@]+"${listed_containers[@]}"}"; do
-                if [[ "$scanned" == "$container" ]]; then
-                    already_scanned=true
-                    break
-                fi
-            done
-            [[ "$already_scanned" == "false" ]] || continue
-            listed_containers+=("$container")
             _mole_print_container_once "$container"
-        done < <(run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" command find "$physical_root" -maxdepth 6 -type d -path "*/.claude/worktrees" -prune -print0 2> /dev/null)
-    done
+        done < <(run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" command find "$physical_root" -mindepth 1 -maxdepth 6 \
+            \( -name .git -o -name node_modules \) -prune -o \
+            -type d \( -path "*/.claude/worktrees" -o -name .worktrees -o -name worktrees \) -prune -print0 2> /dev/null)
+    done < <(_agent_worktree_search_roots)
 
     # Repositories outside every root: a user's two clean worktrees held 2.5 GB
     # in one (Mole Mac diagnose 20261122-195231). Only real folders count, so a
@@ -3485,8 +3485,9 @@ agent_worktree_containers() {
 # AI coding agents create full checkouts that accumulate silently: Claude Code
 # under <project>/.claude/worktrees/, the Codex app under ~/.codex/worktrees/,
 # T3 Code under ~/.t3/worktrees/.
-# Report only, same 1GB bar as other large candidates; removal stays a manual
-# `git worktree remove` decision because a worktree may hold agent work.
+# Report only, same 1GB bar as other large candidates. Merged, clean, idle
+# worktrees were already removed by clean_merged_agent_worktrees; what this
+# row sizes may hold agent work, so its removal stays a manual decision.
 # $1 may name a container listing that Large files started ahead of time.
 report_agent_worktree_candidates() {
     local listing_file="${1:-}"
@@ -3516,6 +3517,7 @@ report_agent_worktree_candidates() {
         owner="${owner##*/}"
         [[ "$container" == */.codex/worktrees ]] && owner="Codex"
         [[ "$container" == */.t3/worktrees ]] && owner="T3 Code"
+        [[ "$container" == "$HOME/.claude/worktrees" ]] && owner="Claude Code"
         mole_review_row "AI agent worktrees" "$container" "$(bytes_to_human "$((size_kb * 1024))")" "$owner"
         note_activity
         start_section_spinner "Scanning large files..."
