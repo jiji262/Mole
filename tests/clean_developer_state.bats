@@ -198,3 +198,40 @@ EOF
 @test "Yarn Berry producer and sink preserve dependencies with a custom whitelist" {
     probe_yarn_berry_boundary custom
 }
+
+@test "should_protect_path protects Touch ID Catacomb, SystemExtensions, Homebrew DBs, and uv tools" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+
+# Always protected (even in uninstall mode):
+for critical in \
+    "/Library/Catacomb" \
+    "/Library/Catacomb/0001" \
+    "/Library/SystemExtensions" \
+    "/Library/SystemExtensions/db.plist"; do
+    should_protect_path "$critical" || { echo "UNPROTECTED_CLEAN:$critical"; exit 1; }
+    MOLE_UNINSTALL_MODE=1 should_protect_path "$critical" || { echo "UNPROTECTED_UNINSTALL:$critical"; exit 1; }
+done
+
+# Protected in automated cleanup mode:
+for dev_state in \
+    "$HOME/.local/share/uv/tools" \
+    "$HOME/.local/share/uv/tools/ruff/bin/ruff" \
+    "/opt/homebrew/var/postgresql@16/base/16384" \
+    "/opt/homebrew/var/mysql/ibdata1" \
+    "/usr/local/var/postgresql@17/PG_VERSION"; do
+    should_protect_path "$dev_state" || { echo "DEV_STATE_UNPROTECTED:$dev_state"; exit 1; }
+done
+
+# Rebuildable uv python install temp stays cleanable:
+if should_protect_path "$HOME/.local/share/uv/python/.temp/partial.tar.gz"; then
+    echo "UV_TEMP_BLOCKED"
+    exit 1
+fi
+echo "STATE_PROTECTION_OK"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"STATE_PROTECTION_OK"* ]]
+}
+

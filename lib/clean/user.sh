@@ -2596,6 +2596,12 @@ clean_browsers() {
     done
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/crx_cache/* "GoogleUpdater CRX cache"
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/*.old "GoogleUpdater old files"
+    safe_clean ~/Library/Application\ Support/Citro\ Labs/EgoUpdater/crx_cache/* "EgoUpdater CRX cache"
+    safe_clean ~/Library/Application\ Support/Citro\ Labs/EgoUpdater/*.old "EgoUpdater old files"
+    safe_clean ~/Library/Application\ Support/Tabbit/TabbitUpdater/crx_cache/* "TabbitUpdater CRX cache"
+    safe_clean ~/Library/Application\ Support/Tabbit/TabbitUpdater/*.old "TabbitUpdater old files"
+    safe_clean ~/Library/Application\ Support/Perplexity/CometUpdater/crx_cache/* "CometUpdater CRX cache"
+    safe_clean ~/Library/Application\ Support/Perplexity/CometUpdater/*.old "CometUpdater old files"
     # Chromium's Caches root holds its live HTTP disk cache like Chrome's.
     if mole_cleanup_targets_exist "$HOME/Library/Caches/Chromium"/*; then
         if mole_clean_process_guard is_chromium_running "Chromium started"; then

@@ -25,15 +25,18 @@ _mole_browser_clones_idle() {
                 *"/Brave Origin"*".app/"* | *"/Brave Origin"*".app.bundle/"* | \
                 *"/Microsoft Edge"*".app/"* | *"/Microsoft Edge"*".app.bundle/"* | \
                 *"/ego lite.app/"* | *"/ego lite.app.bundle/"* | \
+                *"/LINUX DO.app/"* | *"/LINUX DO.app.bundle/"* | \
                 *"/com.google.Chrome"*".code_sign_clone/"* | *"/org.chromium.Chromium.code_sign_clone/"* | \
                 *"/net.imput.helium.code_sign_clone/"* | *"/com.brave.Browser"*".code_sign_clone/"* | \
                 *"/com.microsoft.edgemac.code_sign_clone/"* | *"/com.citrolabs.ego.lite.code_sign_clone/"* | \
+                *"/org.linuxdo.community.macos-cef.code_sign_clone/"* | \
                 "Google Chrome"* | "Chromium" | *"/Google Chrome" | *"/Chromium" | \
                 "Helium" | "Helium Helper"* | *"/Helium" | \
                 "Brave Browser"* | "Brave Origin"* | *"/Brave Browser" | *"/Brave Origin" | \
                 *"/Contents/MacOS/Brave Browser"* | *"/Contents/MacOS/Brave Origin"* | \
                 "Microsoft Edge"* | *"/Microsoft Edge" | *"/Contents/MacOS/Microsoft Edge"* | \
-                "ego lite" | "ego Helper"* | *"/ego lite" | *"/Contents/MacOS/ego lite"*) return 1 ;;
+                "ego lite" | "ego Helper"* | *"/ego lite" | *"/Contents/MacOS/ego lite"* | \
+                "LINUX DO" | "LINUX DO Helper"* | *"/LINUX DO" | *"/Contents/MacOS/LINUX DO"*) return 1 ;;
         esac
     done <<< "$output"
 }
@@ -66,6 +69,8 @@ _mole_browser_clone_snapshot() {
         # BrowserClonePolicy.browsers.
         com.microsoft.edgemac.code_sign_clone) app="Microsoft Edge" ;;
         com.citrolabs.ego.lite.code_sign_clone) app="ego lite" ;;
+        # LINUX DO CEF app: 674 MB across 2 idle signing clones left on a Mac.
+        org.linuxdo.community.macos-cef.code_sign_clone) app="LINUX DO" ;;
         *) return 1 ;;
     esac
     [[ "${rest#*/}" =~ ^code_sign_clone\.[A-Za-z0-9]{6}$ ]] || return 1
@@ -124,7 +129,7 @@ clean_browser_code_sign_clones() {
     for id in com.google.Chrome com.google.Chrome.beta com.google.Chrome.dev com.google.Chrome.canary org.chromium.Chromium net.imput.helium \
         com.brave.Browser com.brave.Browser.beta com.brave.Browser.nightly \
         com.brave.Browser.origin com.brave.Browser.origin.beta com.brave.Browser.origin.nightly \
-        com.microsoft.edgemac com.citrolabs.ego.lite; do
+        com.microsoft.edgemac com.citrolabs.ego.lite org.linuxdo.community.macos-cef; do
         for path in "$root/$id.code_sign_clone"/code_sign_clone.*; do
             [[ -d "$path" && ! -L "$path" ]] || continue
             system_cleanup_budget_reached "$deadline" && return 0

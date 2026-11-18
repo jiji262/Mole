@@ -429,6 +429,9 @@ should_protect_path() {
             "$HOME/.prometheus/data" | "$HOME/.prometheus/data/"* | \
                 "$HOME/.jupyter/runtime" | "$HOME/.jupyter/runtime/"* | \
                 "$HOME/.yarn/berry/cache" | "$HOME/.yarn/berry/cache/"* | \
+                "$HOME/.local/share/uv/tools" | "$HOME/.local/share/uv/tools/"* | \
+                /opt/homebrew/var/postgresql* | /opt/homebrew/var/mysql* | \
+                /usr/local/var/postgresql* | /usr/local/var/mysql* | \
                 "$HOME/.gitconfig.lock" | "$HOME/.gitconfig.bak"* | \
                 "$HOME/.config/fish/fish_history.bak"* | \
                 "$HOME/.bash_history.bak"* | "$HOME/.zsh_history.bak"*)
@@ -618,7 +621,9 @@ should_protect_path() {
             */Library/Contacts | */Library/Contacts/*)
             return 0
             ;;
-        /Library/Audio/Plug-Ins/Components | /Library/Audio/Plug-Ins/Components/* | \
+        /Library/Catacomb | /Library/Catacomb/* | \
+            /Library/SystemExtensions | /Library/SystemExtensions/* | \
+            /Library/Audio/Plug-Ins/Components | /Library/Audio/Plug-Ins/Components/* | \
             /Library/Audio/Plug-Ins/VST | /Library/Audio/Plug-Ins/VST/* | \
             /Library/Audio/Plug-Ins/VST3 | /Library/Audio/Plug-Ins/VST3/* | \
             /Library/Application\ Support/iZotope | /Library/Application\ Support/iZotope/* | \

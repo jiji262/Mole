@@ -6060,3 +6060,80 @@ EOF
     # The first cache's command ran; the interrupt stops the second one.
     [[ "$output" == *"RAN=1"* ]] || { echo "$output"; return 1; }
 }
+
+@test "frontend darwin temp bundler caches clean non-symlink entries when idle and skip linked roots" {
+    local darwin_temp="$HOME/darwin-temp-frontend"
+    local outside_root="$HOME/outside-frontend-data"
+    mkdir -p \
+        "$darwin_temp/remotion-webpack-bundle-abc/chunk" \
+        "$darwin_temp/jest_dx" \
+        "$darwin_temp/node-compile-cache" \
+        "$darwin_temp/ts-node-123" \
+        "$darwin_temp/playwright-transform-cache-501" \
+        "$darwin_temp/tsx-501" \
+        "$outside_root"
+    printf 'bundle\n' > "$darwin_temp/remotion-webpack-bundle-abc/chunk/main.js"
+    printf 'jest\n' > "$darwin_temp/jest_dx/cache.json"
+    printf 'v8\n' > "$darwin_temp/node-compile-cache/v8.blob"
+    printf 'keep\n' > "$outside_root/secret.txt"
+    ln -s "$outside_root" "$darwin_temp/remotion-webpack-bundle-linked"
+    ln -s "$outside_root/secret.txt" "$darwin_temp/node-compile-cache/linked.blob"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DARWIN_TEMP="$darwin_temp" \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_darwin_user_temp_root() { printf '%s\n' "$DARWIN_TEMP"; }
+frontend_temp_bundler_process_state() { return 1; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        printf 'CLEAN=%s|%s\n' "$description" "$1"
+        shift
+    done
+}
+clean_frontend_darwin_temp_caches
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN=Remotion webpack temp cache|$darwin_temp/remotion-webpack-bundle-abc/chunk"* ]] || return 1
+    [[ "$output" == *"CLEAN=Jest temp cache|$darwin_temp/jest_dx/cache.json"* ]] || return 1
+    [[ "$output" == *"CLEAN=Node compile temp cache|$darwin_temp/node-compile-cache/v8.blob"* ]] || return 1
+    [[ "$output" != *"remotion-webpack-bundle-linked"* ]] || return 1
+    [[ "$output" != *"linked.blob"* ]] || return 1
+    [ -f "$outside_root/secret.txt" ]
+}
+
+@test "frontend darwin temp bundler caches defer while Node runs and stop on unknown process state" {
+    local darwin_temp="$HOME/darwin-temp-frontend-busy"
+    mkdir -p "$darwin_temp/remotion-webpack-bundle-1" "$darwin_temp/node-compile-cache"
+    printf 'a\n' > "$darwin_temp/remotion-webpack-bundle-1/a.js"
+    printf 'b\n' > "$darwin_temp/node-compile-cache/b.blob"
+
+    local state
+    for state in 0 2; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DARWIN_TEMP="$darwin_temp" \
+            PROBE_STATE="$state" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_darwin_user_temp_root() { printf '%s\n' "$DARWIN_TEMP"; }
+frontend_temp_bundler_process_state() { return "$PROBE_STATE"; }
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_frontend_darwin_temp_caches
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || return 1
+        if [[ $state -eq 0 ]]; then
+            [[ "$output" == *"DEFER=Node.js"* ]] || return 1
+        else
+            [[ "$output" == *"Frontend temp bundler caches · stopped (process state unknown)"* ]] || return 1
+        fi
+    done
+    [ -f "$darwin_temp/remotion-webpack-bundle-1/a.js" ]
+}
+

@@ -4472,6 +4472,29 @@ comet_fixture() {
     [[ "$output" != *"Profile Foo"* ]]
 }
 
+@test "fork chromium leaves clean ego lite when idle and defer while ego lite runs" {
+    local case_home root
+    case_home=$(fork_caches_case_home)
+    root="$case_home/Library/Application Support/Citro Labs/ego lite"
+    mkdir -p "$root/GraphiteDawnCache" "$root/Profile 1/GPUCache" "$root/Profile 1/Local Storage"
+    printf 'g\n' > "$root/GraphiteDawnCache/g"
+    printf 'p\n' > "$root/Profile 1/GPUCache/p"
+    printf 'keep\n' > "$root/Profile 1/Local Storage/keep"
+    printf '%s\n' "/Applications/ego lite.app/Contents/MacOS/ego lite" > "$case_home/ps-busy"
+
+    fork_caches_run "$case_home" clean_fork_app_caches
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -f "$root/GraphiteDawnCache/g" ] || return 1
+    [ -f "$root/Profile 1/GPUCache/p" ] || return 1
+
+    rm -f -- "$case_home/ps-busy" # SAFE: test-owned fixture
+    fork_caches_run "$case_home" clean_fork_app_caches
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$root/GraphiteDawnCache/g" ] || return 1
+    [ ! -e "$root/Profile 1/GPUCache/p" ] || return 1
+    [ -f "$root/Profile 1/Local Storage/keep" ]
+}
+
 # ----------------------------------------------------------------------------
 # QQ (NT) sandboxed logs, QQ docs caches and the installed-version archive
 # ----------------------------------------------------------------------------

@@ -35,12 +35,14 @@ _MOLE_FORK_PROFILE_RE='^Profile [0-9]+$'
 MOLE_FORK_CHROMIUM_TABLE=(
     "Library/Application Support/Tabbit|Tabbit|fork_tabbit_process_state|chromium"
     "Library/Application Support/Comet|Comet|fork_comet_process_state|chromium"
+    "Library/Application Support/Citro Labs/ego lite|ego lite|fork_ego_lite_process_state|chromium"
     "Library/Application Support/Douzy|Douzy|fork_douzy_process_state|electron"
     ".local/share/x-browser-profile|x-browser-profile|fork_profile_args_process_state|chromium"
 )
 
 fork_tabbit_process_state() { mole_pgrep_any -x Tabbit -f '/Tabbit[.]app/Contents/'; }
 fork_comet_process_state() { mole_pgrep_any -x Comet -f '/Comet[.]app/Contents/'; }
+fork_ego_lite_process_state() { mole_pgrep_any -x "ego lite" -f '/ego lite[.]app/Contents/'; }
 fork_douzy_process_state() { mole_pgrep_any -x Douzy -f '/Douzy[.]app/Contents/'; }
 
 # An automation profile has no app of its own: the browser holding it names

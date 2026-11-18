@@ -124,6 +124,23 @@ ego Helper (Renderer)'; do
     [ "$code_sign_cleaned" -eq 3 ]
 }
 
+@test "browser clone cleanup reaches LINUX DO and retains it while LINUX DO runs" {
+    local linuxdo="$CLONE_ROOT/org.linuxdo.community.macos-cef.code_sign_clone/code_sign_clone.7AfI9y"
+    mkdir -p "$linuxdo/LINUX DO.app.bundle/Contents/MacOS"
+    printf 'fixture executable' >"$linuxdo/LINUX DO.app.bundle/Contents/MacOS/LINUX DO"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string org.linuxdo.community.macos-cef' "$linuxdo/LINUX DO.app.bundle/Contents/Info.plist" >/dev/null
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string LINUX DO' "$linuxdo/LINUX DO.app.bundle/Contents/Info.plist"
+    for PROCESS_TABLE in '/sbin/launchd
+/Applications/LINUX DO.app/Contents/MacOS/LINUX DO' '/sbin/launchd
+LINUX DO Helper (Renderer)'; do
+        clean_browser_code_sign_clones
+    done
+    [ ! -s "$CALLS" ]
+    PROCESS_TABLE=/sbin/launchd clean_browser_code_sign_clones
+    grep -qx "$linuxdo" "$CALLS"
+    [ "$code_sign_cleaned" -eq 2 ]
+}
+
 @test "browser clone cleanup retains running browser helpers and unknown process probes" {
     for PROCESS_TABLE in '/sbin/launchd
 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome' '/sbin/launchd

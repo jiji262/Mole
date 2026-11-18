@@ -1877,6 +1877,96 @@ clean_dev_cloud() {
     safe_clean ~/.config/gcloud/logs/* "Google Cloud logs"
     safe_clean ~/.azure/logs/* "Azure CLI logs"
 }
+frontend_temp_bundler_process_state() {
+    mole_pgrep_any \
+        -x node \
+        -x bun \
+        -x deno \
+        -x tsx \
+        -x esbuild \
+        -f "[t]s-node" \
+        -f "[j]est" \
+        -f "[w]ebpack" \
+        -f "[r]emotion" \
+        -f "[p]laywright"
+}
+
+# Node/JS bundlers and transpilers write rebuildable compile/transform bundles
+# under DARWIN_USER_TEMP_DIR (measured >1.2 GB across remotion-webpack-bundle-*,
+# jest_*, node-compile-cache, ts-node-*, playwright-transform-cache-*, tsx-*).
+# Clean only non-symlink children inside ordinary invoking-user-owned cache
+# directories when Node/bundler runtimes are idle.
+clean_frontend_darwin_temp_caches() {
+    local temp_root=""
+    local resolver_rc=0
+    temp_root=$(mole_darwin_user_temp_root) || resolver_rc=$?
+    if [[ $resolver_rc -ne 0 ]]; then
+        if mole_rc_timeout "$resolver_rc"; then
+            debug_log "Skipping frontend temp bundler caches: DARWIN_USER_TEMP_DIR lookup timed out"
+            return 0
+        fi
+        mole_rc_signal "$resolver_rc" && return "$resolver_rc"
+        return 0
+    fi
+
+    local -a specs=(
+        "remotion-webpack-bundle-*|Remotion webpack temp cache"
+        "jest_*|Jest temp cache"
+        "node-compile-cache|Node compile temp cache"
+        "ts-node-*|ts-node temp cache"
+        "playwright-transform-cache-*|Playwright transform temp cache"
+        "tsx-*|tsx temp cache"
+    )
+
+    local spec pattern cache_root candidate has_any=false
+    for spec in "${specs[@]}"; do
+        pattern="${spec%%|*}"
+        # shellcheck disable=SC2206 # intentional glob expansion under fixed temp_root
+        local -a matched_roots=("$temp_root"/$pattern)
+        for cache_root in ${matched_roots[@]+"${matched_roots[@]}"}; do
+            [[ -d "$cache_root" && ! -L "$cache_root" && -O "$cache_root" ]] || continue
+            for candidate in "$cache_root"/* "$cache_root"/.[!.]* "$cache_root"/..?*; do
+                [[ -e "$candidate" && ! -L "$candidate" ]] || continue
+                has_any=true
+                break 3
+            done
+        done
+    done
+    [[ "$has_any" == "true" ]] || return 0
+
+    local _MOLE_CLEAN_GUARD_REASON=""
+    if ! mole_clean_process_guard frontend_temp_bundler_process_state "Node.js started"; then
+        mole_report_guard_stop "Frontend temp bundler caches" mole_defer_cleanup_family "Node.js"
+        return 0
+    fi
+
+    local label
+    local -a candidates=()
+    for spec in "${specs[@]}"; do
+        pattern="${spec%%|*}"
+        label="${spec#*|}"
+        # shellcheck disable=SC2206 # intentional glob expansion under fixed temp_root
+        local -a matched_roots=("$temp_root"/$pattern)
+        for cache_root in ${matched_roots[@]+"${matched_roots[@]}"}; do
+            [[ -d "$cache_root" && ! -L "$cache_root" && -O "$cache_root" ]] || continue
+            candidates=()
+            for candidate in "$cache_root"/* "$cache_root"/.[!.]* "$cache_root"/..?*; do
+                [[ -e "$candidate" && ! -L "$candidate" ]] || continue
+                candidates+=("$candidate")
+            done
+            [[ ${#candidates[@]} -gt 0 ]] || continue
+            clean_guarded_dev_cache_root \
+                "$temp_root" \
+                "$cache_root" \
+                frontend_temp_bundler_process_state \
+                "Node.js" \
+                "$label" \
+                "${candidates[@]}" || return $?
+        done
+    done
+    return 0
+}
+
 # Frontend build caches.
 clean_dev_frontend() {
     safe_clean ~/.cache/typescript/* "TypeScript cache"
@@ -1891,6 +1981,7 @@ clean_dev_frontend() {
     safe_clean ~/.parcel-cache/* "Parcel cache"
     safe_clean ~/.cache/eslint/* "ESLint cache"
     safe_clean ~/.cache/prettier/* "Prettier cache"
+    clean_frontend_darwin_temp_caches || return $?
 }
 # Check for multiple Android NDK versions.
 check_android_ndk() {
